@@ -1,0 +1,14 @@
+# build outputs
+/httpd
+/httpd-san
+
+# test scratch (document root, the 10MB fixture, the server's log)
+t/tmp/
+
+# editor / tooling debris
+*.o
+*.core
+core
+vgcore.*
+.cache/
+compile_commands.json
