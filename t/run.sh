@@ -66,12 +66,14 @@ fetch() {
 	          "$@" "$U$_p" 2>"$TD/curlerr") || ST="curl-exit-$?"
 }
 
-# tstatus NAME WANT PATH [curl args...]
+# tstatus NAME WANT PATH [curl args...] -- WANT may list alternatives
 tstatus() {
 	_n=$1; _w=$2; shift 2
 	fetch "$@"
-	if [ "$ST" = "$_w" ]; then ok "$_n"
-	else bad "$_n" "want status $_w, got $ST" "$(cat "$TD/curlerr")"; fi
+	case " $_w " in
+	*" $ST "*) ok "$_n" ;;
+	*) bad "$_n" "want status $_w, got $ST" "$(cat "$TD/curlerr")" ;;
+	esac
 }
 
 # tbody NAME WANT-EXACT PATH [curl args...]
@@ -92,16 +94,83 @@ thdr() {
 }
 
 # ---------------------------------------------------------------------------
+# raw REQUEST [raw.py args...]  ->  $TD/raw, $RST status code
+# For requests curl is too correct to construct. Weaker than curl as an
+# oracle -- the bytes are ours -- but the verdict is still httpd's.
+# ---------------------------------------------------------------------------
+raw() {
+	_q=$1; shift
+	# %b, so the request bytes can be written with \r\n escapes. $(printf)
+	# cannot carry a trailing CRLF: command substitution strips it, which
+	# silently turned every raw request into a bare-CR request once.
+	printf '%b' "$_q" | python3 "$ROOT/t/raw.py" "$PORT" "$@" \
+	        >"$TD/raw" 2>"$TD/rawerr"
+	RST=$(sed -n '1s|^HTTP/1\.[01] \([0-9][0-9]*\).*|\1|p' "$TD/raw" \
+	      | tr -d '\r')
+}
+
+# traw NAME WANT REQUEST [raw.py args...] -- WANT may list alternatives
+traw() {
+	_n=$1; _w=$2; _q=$3; shift 3
+	raw "$_q" "$@"
+	case " $_w " in
+	*" $RST "*) ok "raw: $_n" ;;
+	*) bad "raw: $_n" "want status $_w, got [$RST]" \
+	       "$(head -c 200 "$TD/raw")" "$(cat "$TD/rawerr")" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
 # 1. the socket is there, and it speaks HTTP/1.1
 # ---------------------------------------------------------------------------
-tstatus 'root: 200'              200 /
-thdr    'root: content-length'   '^Content-Length: 6'  /
-tbody   'root: body'             'httpd'               /
+# No file server yet: every target is 404. What is asserted here is that a
+# well-formed request gets a well-formed response.
+tstatus 'root: 404 for now'      404 /
+thdr    'root: has Date'         '^Date: [A-Z][a-z][a-z], ' /
+thdr    'root: has Content-Length' '^Content-Length: [0-9]'  /
 
 # The announced port is the port it is actually listening on -- otherwise
 # every assertion above would be against some other process.
 if [ "$ST" != "curl-exit-7" ]; then ok 'port: announced port accepts'
 else bad 'port: announced port accepts' 'connection refused'; fi
+
+# ---------------------------------------------------------------------------
+# 2. the request line (RFC 9112 section 3)
+# ---------------------------------------------------------------------------
+tstatus 'method: POST is 405'     405 / -X POST
+thdr    'method: 405 has Allow'   '^Allow: GET, HEAD' / -X POST
+tstatus 'method: unknown is 405'  405 / -X FROBNICATE
+tstatus 'version: HTTP/1.0 ok'    404 / --http1.0
+
+# Exactly one SP between the three fields. Being generous here is one of the
+# two classic request smuggling primitives: a server that accepts
+# "GET  /x HTTP/1.1" and a proxy that does not disagree about the target.
+traw 'two spaces after method'    400 "GET  / HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'leading space'              400 " GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'tab instead of space'       400 "GET\t/ HTTP/1.1\r\n\r\n"
+traw 'no version (HTTP/0.9)'      400 "GET /\r\n\r\n"
+traw 'version not HTTP/'          400 "GET / FTP/1.1\r\nHost: x\r\n\r\n"
+traw 'version HTTP/1.1x'          400 "GET / HTTP/1.1x\r\nHost: x\r\n\r\n"
+traw 'version HTTP/11'            400 "GET / HTTP/11\r\nHost: x\r\n\r\n"
+traw 'version HTTP/2.0'           505 "GET / HTTP/2.0\r\nHost: x\r\n\r\n"
+traw 'version HTTP/1.9'           505 "GET / HTTP/1.9\r\nHost: x\r\n\r\n"
+traw 'method with a bad char'     400 "GE{T} / HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'empty method'               400 " / HTTP/1.1\r\nHost: x\r\n\r\n"
+
+# An over-long request line must be refused by the code, not by the stack.
+# 414 is the RFC 9110 code for exactly this; a header *section* that overflows
+# the buffer is 431. Both are accepted here so the assertion is about
+# refusing rather than about which refusal.
+LONG=$(python3 -c 'print("a" * 5000)')
+tstatus 'reqline: over-long target' '414 431 400' "/$LONG"
+MANY=""
+i=0
+while [ "$i" -lt 200 ]; do
+	MANY="$MANY -H X-Pad-$i:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	i=$((i + 1))
+done
+# shellcheck disable=SC2086
+tstatus 'reqline: over-long header section' '431 400' / $MANY
 
 # ---------------------------------------------------------------------------
 # the server is still alive after everything above
