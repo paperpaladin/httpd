@@ -173,6 +173,56 @@ done
 tstatus 'reqline: over-long header section' '431 400' / $MANY
 
 # ---------------------------------------------------------------------------
+# 3. the header section, and the two request smuggling primitives
+# ---------------------------------------------------------------------------
+# curl can be talked into some of these, and where it can, it is the better
+# oracle: the bytes on the wire are then not ours.
+tstatus 'hdr: space before colon'  400 / -H 'Host : evil'
+tstatus 'hdr: CL and TE together'  400 / -H 'Transfer-Encoding: chunked' \
+                                          -H 'Content-Length: 0'
+tstatus 'hdr: TE gzip is 501'      501 / -H 'Transfer-Encoding: gzip'
+
+traw 'space before colon'       400 "GET / HTTP/1.1\r\nHost : x\r\n\r\n"
+traw 'tab before colon'         400 "GET / HTTP/1.1\r\nHost\t: x\r\n\r\n"
+traw 'no colon at all'          400 "GET / HTTP/1.1\r\nHost: x\r\nJustWords\r\n\r\n"
+traw 'empty field name'         400 "GET / HTTP/1.1\r\nHost: x\r\n: v\r\n\r\n"
+traw 'obs-fold continuation'    400 "GET / HTTP/1.1\r\nHost: x\r\nX: a\r\n b\r\n\r\n"
+traw 'missing Host'             400 "GET / HTTP/1.1\r\n\r\n"
+traw 'two Host fields'          400 "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"
+
+# RFC 9112 6.1 and 6.3: a message with both framings is framed one way by
+# this hop and the other way by the next one. That is the whole of request
+# smuggling, and it is refused rather than resolved.
+traw 'CL + TE: chunked'         400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"
+traw 'TE: chunked + CL (order)' 400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n"
+traw 'two conflicting CL'       400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n"
+traw 'CL as a comma list'       400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0, 0\r\n\r\n"
+traw 'negative CL'              400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"
+traw 'signed CL'                400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: +1\r\n\r\n"
+traw 'hex CL'                   400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0x10\r\n\r\n"
+traw 'CL that overflows'        400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n"
+traw 'empty CL'                 400 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: \r\n\r\n"
+
+# ... and the cases next to them that must NOT be refused, because a parser
+# that rejects everything also passes every refusal assertion above.
+traw 'two identical CL is ok'   404 \
+	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"
+traw 'odd OWS round the value'  404 \
+	"GET / HTTP/1.1\r\nHost:    x\t \r\nContent-Length:  0 \r\n\r\n"
+traw 'lower-case field names'   404 "GET / HTTP/1.1\r\nhOsT: x\r\n\r\n"
+traw 'unknown fields ignored'   404 \
+	"GET / HTTP/1.1\r\nHost: x\r\nX-Whatever: ~!#\$%&'*+-.^_\`|\r\n\r\n"
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'

@@ -44,6 +44,12 @@ struct req {
 	char *target;
 	int   minor;          /* HTTP/1.minor */
 	char *head;           /* first header line, or NULL */
+	long long clen;       /* Content-Length, or -1 if absent */
+	int   te_chunked;     /* Transfer-Encoding: chunked */
+	int   te_seen;
+	int   nhost;
+	int   want_close;     /* Connection: close */
+	int   want_keep;      /* Connection: keep-alive */
 };
 
 static struct conn conns[MAXCONN];
@@ -164,11 +170,123 @@ static int parse_reqline(char *line, struct req *r)
 	return 0;
 }
 
+/* ---- header section (RFC 9112 section 5) --------------------------------- */
+
+static int lc(int ch) { return ch >= 'A' && ch <= 'Z' ? ch + 32 : ch; }
+
+/* Field names are case-insensitive; `want` must be given in lower case. */
+static int name_is(const char *name, const char *want)
+{
+	size_t i;
+
+	for (i = 0; name[i] && want[i]; i++)
+		if (lc((unsigned char)name[i]) != want[i]) return 0;
+	return !name[i] && !want[i];
+}
+
+static int all_digits(const char *s)
+{
+	if (!*s) return 0;
+	for (; *s; s++)
+		if (*s < '0' || *s > '9') return 0;
+	return 1;
+}
+
+/*
+ * Walk the header section in place. Returns 0, or the status code to send.
+ *
+ * Every refusal in here is a message-framing refusal, which is why this runs
+ * before the method is even looked at: if two parties can disagree about
+ * where this request ends, nothing about the next one is knowable, and
+ * answering 405 to a smuggling attempt would mean having parsed it.
+ */
+static int parse_headers(char *p, struct req *r)
+{
+	r->clen = -1;
+
+	while (*p) {
+		char *line = p, *nl, *colon, *v;
+		size_t vl;
+
+		nl = strstr(p, "\r\n");
+		if (nl) { *nl = '\0'; p = nl + 2; }
+		else      p = line + strlen(line);
+
+		if (!*line) continue;
+
+		/* obs-fold. RFC 9112 5.2 lets a server reject it, and
+		 * accepting it means a header value can contain a line that
+		 * the next hop reads as a header of its own. */
+		if (*line == ' ' || *line == '\t') return 400;
+
+		/* A bare CR or LF inside a field. The section was split on
+		 * CRLF, so anything left is an embedded line terminator --
+		 * the other half of the smuggling pair. */
+		if (strpbrk(line, "\r\n")) return 400;
+
+		colon = strchr(line, ':');
+		if (!colon) return 400;
+		*colon = '\0';
+
+		/* This single check is what rejects "Host : x". The space is
+		 * not a tchar, so it is not part of a field name, so the line
+		 * is malformed -- not a header named "Host " and not a header
+		 * named "Host". RFC 9112 5.1 requires rejecting it. */
+		if (!all_tchar(line)) return 400;
+
+		v = colon + 1;
+		while (*v == ' ' || *v == '\t') v++;
+		vl = strlen(v);
+		while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t'))
+			v[--vl] = '\0';
+
+		if (name_is(line, "content-length")) {
+			long long n;
+			char *end;
+
+			/* No sign, no whitespace, no comma list. A
+			 * comma-separated list of identical values is legal
+			 * per RFC 9110 8.6 and is refused anyway: it exists
+			 * only because something upstream merged two fields,
+			 * which is the case worth refusing. */
+			if (!all_digits(v)) return 400;
+			errno = 0;
+			n = strtoll(v, &end, 10);
+			if (errno || *end) return 400;
+			if (r->clen >= 0 && r->clen != n) return 400;
+			r->clen = n;
+		} else if (name_is(line, "transfer-encoding")) {
+			r->te_seen = 1;
+			if (name_is(v, "chunked")) r->te_chunked = 1;
+			else return 501;
+		} else if (name_is(line, "host")) {
+			r->nhost++;
+		} else if (name_is(line, "connection")) {
+			if (strcasestr(v, "close")) r->want_close = 1;
+			if (strcasestr(v, "keep-alive")) r->want_keep = 1;
+		}
+	}
+
+	/* The smuggling refusal. RFC 9112 6.1: if a message has both, the
+	 * Transfer-Encoding overrides Content-Length -- and 6.3 says such a
+	 * message "ought to be handled as an error", because one hop will
+	 * frame it by one field and the next hop by the other. Refuse. */
+	if (r->te_seen && r->clen >= 0) return 400;
+
+	/* HTTP/1.1 requires exactly one Host. Two Host fields is a routing
+	 * ambiguity in front of any virtual host, here or downstream. */
+	if (r->nhost > 1) return 400;
+	if (r->minor >= 1 && r->nhost != 1) return 400;
+
+	return 0;
+}
+
 /* ---- request handling ---------------------------------------------------- */
 
 static void handle(struct conn *c)
 {
 	char *eoh, *line, *nl;
+	char empty[1] = "";
 	struct req r;
 	int code;
 
@@ -184,9 +302,16 @@ static void handle(struct conn *c)
 	}
 
 	code = parse_reqline(line, &r);
+	/* parse_headers() runs even when there is no header line at all: the
+	 * "exactly one Host" rule is enforced at its end, and skipping the
+	 * call for "GET / HTTP/1.1" with an empty section let that request
+	 * through with no Host. Found by the assertion for it. */
+	if (!code)
+		code = parse_headers(r.head ? r.head : empty, &r);
 	if (code) {
 		reply(c, code, code == 400 ? "Bad Request"
 		            : code == 414 ? "URI Too Long"
+		            : code == 501 ? "Not Implemented"
 		                          : "HTTP Version Not Supported",
 		      NULL, 1);
 		return;
