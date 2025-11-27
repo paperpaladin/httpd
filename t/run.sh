@@ -29,11 +29,36 @@ skipt() { skip=$((skip + 1)); printf 'skip  %s  (%s)\n' "$1" "$2"; }
 [ -x "$HTTPD" ] || { echo "run 'make' first" >&2; exit 2; }
 
 rm -rf "$TD"; mkdir -p "$TD" || exit 2
+: >"$TD/allbodies"
+
+# ---------------------------------------------------------------------------
+# the fixture: a document root, and a secret OUTSIDE it
+#
+# The secret file is the point. Every traversal assertion checks the status
+# code AND greps the response body for this string, because a 200 with the
+# wrong body and a 403 with the right one are both failures, and only one of
+# them is visible in the status.
+# ---------------------------------------------------------------------------
+R="$TD/root"
+SECRET='SUPERSECRET-5f3a9c-DO-NOT-SERVE'
+
+mkdir -p "$R/sub" "$R/nodir" "$R/.git"
+printf '%s\n' "$SECRET" > "$TD/secret.txt"
+printf '<h1>root index</h1>\n'  > "$R/index.html"
+printf 'plain text ok\n'         > "$R/ok.txt"
+printf '<h1>sub index</h1>\n'    > "$R/sub/index.html"
+printf 'deep\n'                  > "$R/sub/deep.txt"
+printf 'dotfile body\n'          > "$R/.hidden"
+printf 'dotdir body\n'           > "$R/.git/config"
+ln -s "$TD/secret.txt" "$R/escape"      # symlink out of the root, readable
+ln -s "$TD"            "$R/escapedir"   # symlink to the directory above it
+ln -s ok.txt           "$R/inside"      # symlink that stays inside: allowed
+mkfifo "$R/fifo" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # the server under test
 # ---------------------------------------------------------------------------
-"$HTTPD" -t 5 >"$TD/port" 2>"$TD/log" &
+"$HTTPD" -r "$R" -t 5 >"$TD/port" 2>"$TD/log" &
 SRV=$!
 # The trap is the reason `make test` cannot leave a server behind, and it is
 # installed before the first assertion rather than after.
@@ -64,6 +89,11 @@ fetch() {
 	ST=$(curl --http1.1 -sS --max-time "$MT" \
 	          -o "$TD/b" -D "$TD/h" -w '%{http_code}' \
 	          "$@" "$U$_p" 2>"$TD/curlerr") || ST="curl-exit-$?"
+	# Every byte of every response body this suite has ever received,
+	# in one file. The secret-file assertion at the end of section 5
+	# greps THIS, not just the last response -- otherwise it is an
+	# assertion about one request that happened to be refused.
+	cat "$TD/b" >>"$TD/allbodies" 2>/dev/null
 }
 
 # tstatus NAME WANT PATH [curl args...] -- WANT may list alternatives
@@ -105,6 +135,7 @@ raw() {
 	# silently turned every raw request into a bare-CR request once.
 	printf '%b' "$_q" | python3 "$ROOT/t/raw.py" "$PORT" "$@" \
 	        >"$TD/raw" 2>"$TD/rawerr"
+	cat "$TD/raw" >>"$TD/allbodies" 2>/dev/null
 	RST=$(sed -n '1s|^HTTP/1\.[01] \([0-9][0-9]*\).*|\1|p' "$TD/raw" \
 	      | tr -d '\r')
 }
@@ -123,9 +154,7 @@ traw() {
 # ---------------------------------------------------------------------------
 # 1. the socket is there, and it speaks HTTP/1.1
 # ---------------------------------------------------------------------------
-# No file server yet: every target is 404. What is asserted here is that a
-# well-formed request gets a well-formed response.
-tstatus 'root: 404 for now'      404 /
+tstatus 'root: 200'              200 /
 thdr    'root: has Date'         '^Date: [A-Z][a-z][a-z], ' /
 thdr    'root: has Content-Length' '^Content-Length: [0-9]'  /
 
@@ -140,7 +169,7 @@ else bad 'port: announced port accepts' 'connection refused'; fi
 tstatus 'method: POST is 405'     405 / -X POST
 thdr    'method: 405 has Allow'   '^Allow: GET, HEAD' / -X POST
 tstatus 'method: unknown is 405'  405 / -X FROBNICATE
-tstatus 'version: HTTP/1.0 ok'    404 / --http1.0
+tstatus 'version: HTTP/1.0 ok'    200 / --http1.0
 
 # Exactly one SP between the three fields. Being generous here is one of the
 # two classic request smuggling primitives: a server that accepts
@@ -214,13 +243,132 @@ traw 'empty CL'                 400 \
 
 # ... and the cases next to them that must NOT be refused, because a parser
 # that rejects everything also passes every refusal assertion above.
-traw 'two identical CL is ok'   404 \
+traw 'two identical CL is ok'   200 \
 	"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"
-traw 'odd OWS round the value'  404 \
+traw 'odd OWS round the value'  200 \
 	"GET / HTTP/1.1\r\nHost:    x\t \r\nContent-Length:  0 \r\n\r\n"
-traw 'lower-case field names'   404 "GET / HTTP/1.1\r\nhOsT: x\r\n\r\n"
-traw 'unknown fields ignored'   404 \
+traw 'lower-case field names'   200 "GET / HTTP/1.1\r\nhOsT: x\r\n\r\n"
+traw 'unknown fields ignored'   200 \
 	"GET / HTTP/1.1\r\nHost: x\r\nX-Whatever: ~!#\$%&'*+-.^_\`|\r\n\r\n"
+
+# ---------------------------------------------------------------------------
+# 4. the path resolver: what it serves
+#
+# These come first. A resolver that refuses everything satisfies every
+# assertion in section 5, so the refusals only mean something next to the
+# requests that must succeed.
+# ---------------------------------------------------------------------------
+tbody 'serve: / is index.html'       '<h1>root index</h1>' /
+tbody 'serve: /index.html'           '<h1>root index</h1>' /index.html
+tbody 'serve: /ok.txt'               'plain text ok'       /ok.txt
+tbody 'serve: /sub/ is sub index'    '<h1>sub index</h1>'  /sub/
+tbody 'serve: /sub (no slash)'       '<h1>sub index</h1>'  /sub
+tbody 'serve: /sub/deep.txt'         'deep'                /sub/deep.txt
+tbody 'serve: "." segments skipped'  'plain text ok'       /./ok.txt --path-as-is
+tbody 'serve: empty segments'        'deep'                /sub//deep.txt --path-as-is
+tbody 'serve: query string ignored'  'plain text ok'       '/ok.txt?a=b&c=d'
+tbody 'serve: %6f%6b decoded'        'plain text ok'       /%6fk.txt
+# A symlink that stays inside the root is a document, not an escape.
+tbody 'serve: symlink inside root'   'plain text ok'       /inside
+tstatus 'serve: missing file is 404' 404 /nope.txt
+tstatus 'serve: missing dir is 404'  404 /nope/nope.txt
+tstatus 'serve: dir with no index'   403 /nodir/
+tstatus 'serve: a fifo is not a doc' 403 /fifo
+
+# ---------------------------------------------------------------------------
+# 5. the path resolver: what it refuses
+#
+# THE security property. Each case asserts a refusing status code and that
+# the secret string is nowhere in the response body. --path-as-is is what
+# stops curl from normalising "/../" away on the client side, so the bytes
+# that reach httpd are the bytes written here.
+# ---------------------------------------------------------------------------
+# tdeny NAME WANT PATH [curl args...]
+tdeny() {
+	_n=$1; _w=$2; shift 2
+	fetch "$@"
+	case " $_w " in
+	*" $ST "*) ;;
+	*) bad "deny: $_n" "want status $_w, got $ST"; return ;;
+	esac
+	if grep -q "$SECRET" "$TD/b" 2>/dev/null; then
+		bad "deny: $_n" "status $ST but the SECRET was in the body!" \
+		    "$(head -c 200 "$TD/b")"
+	else
+		ok "deny: $_n"
+	fi
+}
+
+tdeny 'dot-dot'                403 /../secret.txt            --path-as-is
+tdeny 'dot-dot twice'          403 /../../etc/passwd         --path-as-is
+tdeny 'dot-dot after a dir'    403 /sub/../../secret.txt     --path-as-is
+tdeny 'dot then dot-dot'       403 /./../secret.txt          --path-as-is
+tdeny 'dot-dot trailing'       403 /sub/..                   --path-as-is
+# curl itself percent-decodes %2e and removes the dot segment, sending
+# "GET /secret.txt": verified with curl -v. So --path-as-is is required for
+# the encoded form to reach httpd at all, and without it this assertion was
+# passing on a 404 for a file that does not exist -- a green test for a
+# request that was never made.
+tdeny 'encoded dot-dot'        403 /%2e%2e/secret.txt --path-as-is
+tdeny 'encoded dot-dot-slash'  403 /%2e%2e%2fsecret.txt
+tdeny 'half-encoded'           403 /..%2fsecret.txt
+tdeny 'upper-case hex'         403 /%2E%2E%2Fsecret.txt
+tdeny 'encoded dot-dot deep'   403 /sub/%2e%2e/%2e%2e/secret.txt --path-as-is
+# Double encoding must NOT be decoded twice. "%252e" decodes once to "%2e",
+# which is a filename character. 404 is the correct answer: there is no file
+# called "%2e%2e%2fsecret.txt" in the root. A 200 here would mean the
+# decoder loops.
+tdeny 'double-encoded'         404 /%252e%252e%252fsecret.txt
+tdeny 'triple-encoded'         404 /%25252e%25252e%25252fsecret.txt
+tdeny 'four dots'              403 /....//secret.txt         --path-as-is
+tdeny 'dot-dot semicolon'      403 '/..;/secret.txt'         --path-as-is
+tdeny 'backslash separators'   403 '/..\..\secret.txt'      --path-as-is
+tdeny 'absolute /etc/passwd'   404 /etc/passwd
+tdeny 'bad percent escape'     400 /%zz
+tdeny 'truncated escape'       400 /%2
+tdeny 'NUL via %00'            400 /ok.txt%00.jpg
+tdeny 'bare %00'               400 /%00
+tdeny 'encoded CR'             400 /ok%0d%0atxt
+tdeny 'encoded DEL'            400 /ok%7f.txt
+
+# A symlink inside the root whose target is outside it. The first two layers
+# of the resolver cannot see this at all -- there is nothing hostile in the
+# string "/escape" -- so this is the assertion that realpath(3) containment
+# is doing the work.
+tdeny 'symlink to a file outside' 403 /escape
+tdeny 'symlink to a dir outside'  403 /escapedir/secret.txt
+tdeny 'symlink dir, dir listing'  403 /escapedir/
+
+# Never a dotfile, even though both of these are readable and inside root.
+tstatus 'deny: dotfile'          403 /.hidden
+tstatus 'deny: dot directory'    403 /.git/config
+tstatus 'deny: encoded dotfile'  403 /%2ehidden
+
+# Targets curl will not send.
+traw 'relative target'        400 \
+	"GET ../secret.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'asterisk-form target'   400 "GET * HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'network-path target'    400 "GET //x/ok.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+tdeny 'network-path reference' 400 //ok.txt --path-as-is
+traw 'absolute-form is ok'    200 \
+	"GET http://x/ok.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'absolute-form traversal' 403 \
+	"GET http://x/../secret.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'literal NUL in target'  400 \
+	"GET /ok.txt\000x HTTP/1.1\r\nHost: x\r\n\r\n"
+traw 'literal NUL in a field' 400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nX-A: b\000c\r\n\r\n"
+
+# And the belt-and-braces check: not one byte of the secret file has appeared
+# in any response body this suite has collected.
+if [ ! -s "$TD/allbodies" ]; then
+	bad 'deny: secret never served' 'no response bodies were collected'
+elif grep -q "$SECRET" "$TD/allbodies"; then
+	bad 'deny: secret never served' \
+	    'the SECRET appeared in a response body collected by this suite'
+else
+	ok 'deny: secret never served'
+fi
 
 # ---------------------------------------------------------------------------
 # the server is still alive after everything above
