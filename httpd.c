@@ -410,6 +410,48 @@ static int resolve(const char *target, char *out, size_t outsz)
 	return 0;
 }
 
+/* ---- Content-Type -------------------------------------------------------- */
+/*
+ * By extension, and only by extension. Sniffing the content is what makes a
+ * browser render an uploaded "image" as HTML, and this server has no idea
+ * what the bytes are for.
+ *
+ * shortcut: a hard-coded table, not /etc/mime.types. Fifteen entries covers
+ * what a static site is made of; the upgrade path is reading the system file
+ * at startup into the same lookup, and it is a page of parsing for a list
+ * that nobody here needs.
+ *
+ * No charset parameter. A guessed charset is a claim about bytes this server
+ * has not looked at, and getting it wrong is worse than saying nothing: a
+ * client that is told the wrong charset trusts it over its own detection.
+ */
+static const char *ctype(const char *path)
+{
+	static const struct { const char *ext, *type; } tab[] = {
+		{ "html", "text/html" },      { "htm",  "text/html" },
+		{ "txt",  "text/plain" },     { "css",  "text/css" },
+		{ "js",   "text/javascript" },{ "json", "application/json" },
+		{ "xml",  "application/xml" },{ "pdf",  "application/pdf" },
+		{ "png",  "image/png" },      { "gif",  "image/gif" },
+		{ "jpg",  "image/jpeg" },     { "jpeg", "image/jpeg" },
+		{ "svg",  "image/svg+xml" },  { "ico",  "image/vnd.microsoft.icon" },
+		{ "wasm", "application/wasm" },
+	};
+	const char *slash = strrchr(path, '/');
+	const char *dot = strrchr(slash ? slash : path, '.');
+	size_t i;
+
+	if (!dot || !dot[1]) return "application/octet-stream";
+	for (i = 0; i < sizeof tab / sizeof tab[0]; i++) {
+		size_t j;
+
+		for (j = 0; tab[i].ext[j]; j++)
+			if (lc((unsigned char)dot[1 + j]) != tab[i].ext[j]) break;
+		if (!tab[i].ext[j] && !dot[1 + j]) return tab[i].type;
+	}
+	return "application/octet-stream";
+}
+
 /* ---- serving a file ------------------------------------------------------ */
 
 static void refill(struct conn *c)
@@ -433,6 +475,7 @@ static void refill(struct conn *c)
 static void serve(struct conn *c, struct req *r, const char *path)
 {
 	char date[64], idx[PATH_MAX];
+	const char *served = path;
 	struct stat st;
 	int fd;
 
@@ -479,6 +522,7 @@ static void serve(struct conn *c, struct req *r, const char *path)
 			reply(c, 403, "Forbidden", NULL, 1);
 			return;
 		}
+		served = idx;   /* the type comes from index.html, not the dir */
 	}
 
 	/* A fifo, a device or a socket inside the root is not a document.
@@ -493,7 +537,7 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	c->outlen = c->outoff = 0;
 	out_add(c, "HTTP/1.1 200 OK\r\n");
 	out_add(c, "Date: %s\r\n", date);
-	out_add(c, "Content-Type: application/octet-stream\r\n");
+	out_add(c, "Content-Type: %s\r\n", ctype(served));
 	out_add(c, "Content-Length: %lld\r\n", (long long)st.st_size);
 	out_add(c, "Connection: close\r\n\r\n");
 

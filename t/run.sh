@@ -68,6 +68,33 @@ with open(sys.argv[1], "wb") as f:
     f.write(bytes(random.getrandbits(8) for _ in range(int(sys.argv[2]))))
 PYBIG
 
+# Typed fixtures whose CONTENT matches their extension, so file(1) can be
+# asked the same question from the other side.
+python3 - "$R" <<'PYTYPES'
+import base64, sys, os
+r = sys.argv[1]
+png = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/"
+    "q842iQAAAABJRU5ErkJggg==")
+open(os.path.join(r, "a.png"), "wb").write(png)
+open(os.path.join(r, "a.gif"), "wb").write(
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
+    b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01"
+    b"\x00\x00\x02\x02D\x01\x00;")
+open(os.path.join(r, "a.pdf"), "wb").write(
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")
+open(os.path.join(r, "a.html"), "w").write(
+    "<!doctype html>\n<html><head><title>t</title></head><body>hi</body></html>\n")
+open(os.path.join(r, "a.css"), "w").write("body { color: red }\n")
+open(os.path.join(r, "a.js"), "w").write("export const a = 1;\n")
+open(os.path.join(r, "a.json"), "w").write('{"a": 1}\n')
+open(os.path.join(r, "a.svg"), "w").write(
+    '<svg xmlns="http://www.w3.org/2000/svg"/>\n')
+open(os.path.join(r, "a.unknownext"), "w").write("mystery\n")
+open(os.path.join(r, "noextension"), "w").write("mystery\n")
+open(os.path.join(r, "a.HTML"), "w").write("<html>upper</html>\n")
+PYTYPES
+
 # ---------------------------------------------------------------------------
 # the server under test
 # ---------------------------------------------------------------------------
@@ -407,6 +434,55 @@ fi
 _n=$(wc -c <"$TD/dl")
 if [ "$_n" = "$BIGSZ" ]; then ok 'big: body length matches'
 else bad 'big: body length matches' "want $BIGSZ bytes, got $_n"; fi
+
+# ---------------------------------------------------------------------------
+# 7. Content-Type, by extension
+#
+# Two oracles. curl parses the header and reports it back through
+# -w %{content_type}, so the comparison is against curl's parse and not
+# against a grep of our own output. And file(1) answers the same question
+# from the CONTENT of the same file -- a different program, a different
+# method, no shared code -- for the four fixtures whose bytes really are
+# what their extension claims.
+# ---------------------------------------------------------------------------
+# tctype NAME PATH WANT
+tctype() {
+	_g=$(curl --http1.1 -sS --max-time "$MT" -o /dev/null \
+	          -w '%{content_type}' "$U$2" 2>&1)
+	if [ "$_g" = "$3" ]; then ok "ctype: $1"
+	else bad "ctype: $1" "want [$3], got [$_g]"; fi
+}
+
+tctype '.html'        /a.html        text/html
+tctype '.HTML (case)' /a.HTML        text/html
+tctype '.txt'         /ok.txt        text/plain
+tctype '.css'         /a.css         text/css
+tctype '.js'          /a.js          text/javascript
+tctype '.json'        /a.json        application/json
+tctype '.png'         /a.png         image/png
+tctype '.gif'         /a.gif         image/gif
+tctype '.svg'         /a.svg         image/svg+xml
+tctype '.pdf'         /a.pdf         application/pdf
+tctype 'unknown ext'  /a.unknownext  application/octet-stream
+tctype 'no extension' /noextension   application/octet-stream
+tctype 'dir -> index'  /sub/         text/html
+tctype '.bin'         /big.bin       application/octet-stream
+
+# file(1) reads the bytes; httpd reads the name. They must agree.
+if command -v file >/dev/null 2>&1; then
+	for f in a.html a.png a.gif a.pdf; do
+		_fm=$(file --mime-type -b "$R/$f")
+		_hm=$(curl --http1.1 -sS --max-time "$MT" -o /dev/null \
+		           -w '%{content_type}' "$U/$f" 2>&1)
+		if [ "$_fm" = "$_hm" ]; then ok "ctype: file(1) agrees on $f"
+		else bad "ctype: file(1) agrees on $f" \
+		         "file(1) says [$_fm], httpd says [$_hm]"; fi
+	done
+else
+	for f in a.html a.png a.gif a.pdf; do
+		skipt "ctype: file(1) agrees on $f" "no file(1)"
+	done
+fi
 
 # ---------------------------------------------------------------------------
 # the server is still alive after everything above
