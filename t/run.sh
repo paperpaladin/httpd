@@ -535,6 +535,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 9. conditional GET: Last-Modified and If-Modified-Since
+#
+# date(1) is the oracle for the Last-Modified value: it formats the same
+# mtime from the same stat(2) through a completely different program, so
+# agreement is a statement about the format and the timezone and not about
+# our own strftime call being self-consistent. curl's -z is the oracle for
+# the conditional itself, since curl builds the request date from the file
+# on disk.
+# ---------------------------------------------------------------------------
+fetch /ok.txt
+LM=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+WANT_LM=$(date -u -d "@$(stat -c %Y "$R/ok.txt")" +'%a, %d %b %Y %H:%M:%S GMT')
+if [ "$LM" = "$WANT_LM" ]; then ok 'cond: Last-Modified agrees with date(1)'
+else bad 'cond: Last-Modified agrees with date(1)' \
+         "httpd says [$LM], date(1) says [$WANT_LM]"; fi
+
+tstatus 'cond: exact IMS is 304'   304 /ok.txt -H "If-Modified-Since: $LM"
+tstatus 'cond: future IMS is 304'  304 /ok.txt \
+        -H 'If-Modified-Since: Fri, 31 Dec 2038 23:59:59 GMT'
+tstatus 'cond: old IMS is 200'     200 /ok.txt \
+        -H 'If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT'
+# curl -z builds the date itself from the file's mtime.
+tstatus 'cond: curl -z on the file' 304 /ok.txt -z "$R/ok.txt"
+tstatus 'cond: curl -z 1990'        200 /ok.txt -z '1990-01-01'
+tstatus 'cond: HEAD gets 304 too'   304 /ok.txt -I -H "If-Modified-Since: $LM"
+
+# RFC 9110 13.1.3: an invalid HTTP-date in If-Modified-Since MUST be
+# ignored. 400 would be the natural reflex for this program and it is wrong.
+tstatus 'cond: junk IMS ignored'    200 /ok.txt \
+        -H 'If-Modified-Since: not a date at all'
+# Not with curl: `-H 'Name;'` tells curl to REMOVE the header, so the
+# request went out with no If-Modified-Since at all and the assertion was
+# vacuous. Raw, with a genuinely empty value.
+traw 'empty IMS ignored'        200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since:\r\n\r\n"
+tstatus 'cond: truncated IMS'       200 /ok.txt \
+        -H 'If-Modified-Since: Sun, 06 Nov 1994'
+
+# The two obsolete formats RFC 9110 5.6.7 still requires a recipient to
+# accept. curl will not send either, so these are raw.
+traw 'IMS in RFC 850 format'    304 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Thursday, 31-Dec-37 23:59:59 GMT\r\n\r\n"
+traw 'IMS in asctime format'    304 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Fri Dec 31 23:59:59 2038\r\n\r\n"
+
+# A 304 carries no body and claims no length. Both have to be true: a 304
+# with a Content-Length desynchronises a keep-alive connection.
+raw "GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: $LM\r\n\r\n"
+_n=$(python3 -c 'import sys
+d = open(sys.argv[1], "rb").read()
+i = d.find(b"\r\n\r\n")
+print(len(d) - i - 4 if i >= 0 else -1)' "$TD/raw")
+if [ "$_n" = 0 ]; then ok 'cond: 304 has no body'
+else bad 'cond: 304 has no body' "got $_n bytes after the headers"; fi
+if grep -qi '^Content-Length:' "$TD/raw"; then
+	bad 'cond: 304 has no Content-Length' "$(head -c 200 "$TD/raw")"
+else
+	ok 'cond: 304 has no Content-Length'
+fi
+if grep -q "^Last-Modified: $LM" "$TD/raw"; then
+	ok 'cond: 304 repeats Last-Modified'
+else
+	bad 'cond: 304 repeats Last-Modified' "$(head -c 200 "$TD/raw")"
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
