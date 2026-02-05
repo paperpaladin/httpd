@@ -93,6 +93,7 @@ open(os.path.join(r, "a.svg"), "w").write(
 open(os.path.join(r, "a.unknownext"), "w").write("mystery\n")
 open(os.path.join(r, "noextension"), "w").write("mystery\n")
 open(os.path.join(r, "a.HTML"), "w").write("<html>upper</html>\n")
+open(os.path.join(r, "empty.txt"), "w").write("")
 PYTYPES
 
 # ---------------------------------------------------------------------------
@@ -598,6 +599,110 @@ if grep -q "^Last-Modified: $LM" "$TD/raw"; then
 	ok 'cond: 304 repeats Last-Modified'
 else
 	bad 'cond: 304 repeats Last-Modified' "$(head -c 200 "$TD/raw")"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. byte ranges
+#
+# The oracle is the file on disk cut with tail(1) and head(1) -- two
+# coreutils programs doing the arithmetic independently -- and cmp(1)
+# comparing their answer with the bytes curl received. Boundaries are chosen
+# around the 64KB output buffer, because that is where an off-by-one in the
+# pump hides, and at both ends of the file.
+# ---------------------------------------------------------------------------
+# trange NAME PATH SPEC START LEN SIZE
+trange() {
+	_n=$1; _p=$2; _spec=$3; _s=$4; _l=$5; _sz=$6
+	ST=$(curl --http1.1 -sS --max-time "$MT" -o "$TD/dl" -D "$TD/h" \
+	          -w '%{http_code}' -H "Range: bytes=$_spec" "$U$_p" 2>&1) \
+	    || ST="curl-exit-$?"
+	if [ "$ST" != 206 ]; then
+		bad "range: $_n" "want 206, got $ST"; return
+	fi
+	tail -c +$((_s + 1)) "$R${_p}" | head -c "$_l" > "$TD/want"
+	_cr="bytes $_s-$((_s + _l - 1))/$_sz"
+	# Strip the CRs first: a header line ends with CRLF, so "$" never
+	# anchors against it and an unanchored grep would match a prefix of a
+	# longer size. This cost 24 red assertions against correct headers.
+	tr -d '\r' <"$TD/h" >"$TD/h2"
+	if ! grep -q "^Content-Range: $_cr\$" "$TD/h2"; then
+		bad "range: $_n" "want [Content-Range: $_cr]" "$(cat "$TD/h")"
+		return
+	fi
+	if cmp -s "$TD/want" "$TD/dl"; then ok "range: $_n"
+	else bad "range: $_n" "$(cmp "$TD/want" "$TD/dl" 2>&1)"; fi
+}
+
+# t416 NAME PATH SPEC SIZE
+t416() {
+	fetch "$2" -H "Range: bytes=$3"
+	tr -d '\r' <"$TD/h" >"$TD/h2"
+	if [ "$ST" != 416 ]; then
+		bad "range: $1" "want 416, got $ST"
+	elif grep -q "^Content-Range: bytes \*/$4\$" "$TD/h2"; then
+		ok "range: $1"
+	else
+		bad "range: $1" "want [Content-Range: bytes */$4]" "$(cat "$TD/h")"
+	fi
+}
+
+thdr 'range: Accept-Ranges advertised' '^Accept-Ranges: bytes' /ok.txt
+
+B=$BIGSZ
+trange 'first byte'        /big.bin '0-0'                0          1       "$B"
+trange 'first two'         /big.bin '0-1'                0          2       "$B"
+trange 'byte 1 only'       /big.bin '1-1'                1          1       "$B"
+trange 'exactly one buffer' /big.bin '0-65535'           0          65536   "$B"
+trange 'one buffer plus 1' /big.bin '0-65536'            0          65537   "$B"
+trange 'across the seam'   /big.bin '65535-65536'        65535      2       "$B"
+trange 'second buffer'     /big.bin '65536-131071'       65536      65536   "$B"
+trange 'last two bytes'    /big.bin "$((B - 2))-$((B - 1))" $((B - 2)) 2     "$B"
+trange 'last byte'         /big.bin "$((B - 1))-$((B - 1))" $((B - 1)) 1     "$B"
+trange 'open-ended'        /big.bin "$((B - 100))-"      $((B - 100)) 100    "$B"
+trange 'whole file by range' /big.bin "0-$((B - 1))"     0          "$B"     "$B"
+trange 'suffix 1'          /big.bin '-1'                 $((B - 1)) 1       "$B"
+trange 'suffix 65537'      /big.bin '-65537'             $((B - 65537)) 65537 "$B"
+# last-byte-pos past the end is clamped, NOT refused (RFC 9110 14.1.2).
+trange 'last-pos clamped'  /big.bin "0-$((B + 1000))"    0          "$B"     "$B"
+trange 'suffix past start' /big.bin "-$((B + 1000))"     0          "$B"     "$B"
+trange 'small file whole'  /ok.txt  '0-13'               0          14      14
+trange 'small file clamped' /ok.txt '0-99'               0          14      14
+trange 'small file last'   /ok.txt  '13-13'              13         1       14
+
+# Unsatisfiable: first-byte-pos at or past the end, and a zero-length suffix.
+t416 'first-pos == size'   /ok.txt  '14-14'   14
+t416 'first-pos past size' /ok.txt  '9999-'   14
+t416 'zero-length suffix'  /ok.txt  '-0'      14
+t416 'range on empty file' /empty.txt '0-0'   0
+
+# A multi-range request. This server refuses it rather than building a
+# multipart/byteranges body; RFC 9110 14.2 would also allow ignoring the
+# header and sending 200, so this is a deviation and it is deliberate.
+t416 'multi-range refused'  /ok.txt '0-1,5-6'  14
+t416 'multi-range on big'   /big.bin '0-1,5-6' "$B"
+
+# Malformed or unknown-unit Range: IGNORED, whole body, 200. Not 416 --
+# these are the cases RFC 9110 14.2 says to ignore, and confusing them with
+# the unsatisfiable cases above is the easy mistake.
+tstatus 'range: unknown unit ignored'  200 /ok.txt -H 'Range: items=0-1'
+tstatus 'range: no equals ignored'     200 /ok.txt -H 'Range: bytes 0-1'
+tstatus 'range: non-numeric ignored'   200 /ok.txt -H 'Range: bytes=a-b'
+tstatus 'range: reversed ignored'      200 /ok.txt -H 'Range: bytes=9-1'
+tstatus 'range: empty spec ignored'    200 /ok.txt -H 'Range: bytes='
+tbody   'range: ignored means full'   'plain text ok' /ok.txt -H 'Range: bytes=a-b'
+
+# Conditional wins over Range: RFC 9110 13.2.2 evaluates If-Modified-Since
+# before Range, so this is a 304 and not a 206.
+tstatus 'range: 304 beats 206' 304 /ok.txt -H "If-Modified-Since: $LM" \
+        -H 'Range: bytes=0-1'
+
+# HEAD with a Range: the 206 headers, and no body.
+raw "HEAD /ok.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n"
+if grep -q '^Content-Range: bytes 0-3/14' "$TD/raw" &&
+   grep -q '^Content-Length: 4' "$TD/raw"; then
+	ok 'range: HEAD gets 206 headers'
+else
+	bad 'range: HEAD gets 206 headers' "$(head -c 300 "$TD/raw")"
 fi
 
 # ---------------------------------------------------------------------------

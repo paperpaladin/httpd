@@ -51,6 +51,7 @@ struct req {
 	char *head;           /* first header line, or NULL */
 	long long clen;       /* Content-Length, or -1 if absent */
 	const char *ims;      /* If-Modified-Since, unparsed */
+	const char *range;    /* Range, unparsed */
 	int   te_chunked;     /* Transfer-Encoding: chunked */
 	int   te_seen;
 	int   nhost;
@@ -273,6 +274,8 @@ static int parse_headers(char *p, struct req *r)
 			else return 501;
 		} else if (name_is(line, "host")) {
 			r->nhost++;
+		} else if (name_is(line, "range")) {
+			r->range = v;
 		} else if (name_is(line, "if-modified-since")) {
 			r->ims = v;
 		} else if (name_is(line, "connection")) {
@@ -449,6 +452,77 @@ static int parse_http_date(const char *s, time_t *out)
 	return -1;
 }
 
+/* ---- byte ranges (RFC 9110 14) ------------------------------------------- */
+/*
+ * Returns 0 to ignore the header and send the whole thing, 1 having set
+ * *first and *last, or 416 to refuse.
+ *
+ * The 0 and 416 cases are different rules and are easy to swap. RFC 9110
+ * 14.2: an unsatisfiable range -- one whose first-byte-pos is at or past the
+ * end -- is 416. A range that is merely malformed, or in a unit this server
+ * does not know, is IGNORED and the whole representation is sent. Returning
+ * 416 for a typo would break a client that sent a Range it did not need.
+ *
+ * shortcut: one range only. A multi-range request is refused with 416
+ * rather than answered with multipart/byteranges, which needs a boundary
+ * generator, a per-part header block and a second body pump. Named in the
+ * README as a deviation, because RFC 9110 14.2 would allow ignoring the
+ * header and sending 200 instead, and 416 is the louder answer.
+ */
+static int parse_range(const char *v, off_t size, off_t *first, off_t *last)
+{
+	const char *p = v, *dash;
+	char fb[32];
+	long long a, b;
+
+	if (strncasecmp(p, "bytes", 5) != 0) return 0;   /* unknown unit */
+	p += 5;
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p != '=') return 0;
+	p++;
+	while (*p == ' ' || *p == '\t') p++;
+
+	if (strchr(p, ',')) return 416;                  /* multiple ranges */
+
+	if (*p == '-') {                                 /* suffix-length */
+		p++;
+		if (!all_digits(p)) return 0;
+		errno = 0;
+		b = strtoll(p, NULL, 10);
+		if (errno) b = size;                     /* absurdly large */
+		if (b == 0 || size == 0) return 416;
+		if (b > size) b = size;
+		*first = size - (off_t)b;
+		*last = size - 1;
+		return 1;
+	}
+
+	dash = strchr(p, '-');
+	if (!dash || (size_t)(dash - p) >= sizeof fb) return 0;
+	memcpy(fb, p, (size_t)(dash - p));
+	fb[dash - p] = '\0';
+	if (!all_digits(fb)) return 0;
+	errno = 0;
+	a = strtoll(fb, NULL, 10);
+	if (errno) return 416;                           /* past any size */
+
+	if (dash[1]) {
+		if (!all_digits(dash + 1)) return 0;
+		errno = 0;
+		b = strtoll(dash + 1, NULL, 10);
+		if (errno) b = size - 1;
+	} else {
+		b = size - 1;
+	}
+
+	if (size == 0 || a >= size) return 416;
+	if (b < a) return 0;                             /* "bytes=5-1" */
+	if (b > size - 1) b = size - 1;                  /* clamp, not 416 */
+	*first = (off_t)a;
+	*last = (off_t)b;
+	return 1;
+}
+
 /* ---- Content-Type -------------------------------------------------------- */
 /*
  * By extension, and only by extension. Sniffing the content is what makes a
@@ -516,7 +590,8 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	char date[64], lmod[64], idx[PATH_MAX];
 	const char *served = path;
 	struct stat st;
-	int fd;
+	off_t first, last;
+	int fd, partial = 0;
 
 	/* O_NOFOLLOW is a second, independent refusal for the final
 	 * component: even if realpath(3) were wrong, a symlink here is
@@ -598,17 +673,43 @@ static void serve(struct conn *c, struct req *r, const char *path)
 		}
 	}
 
+	first = 0;
+	last = st.st_size ? st.st_size - 1 : 0;
+	if (r->range) {
+		int rc = parse_range(r->range, st.st_size, &first, &last);
+
+		if (rc == 416) {
+			char extra[64];
+
+			close(fd);
+			snprintf(extra, sizeof extra,
+			         "Content-Range: bytes */%lld\r\n",
+			         (long long)st.st_size);
+			reply(c, 416, "Range Not Satisfiable", extra, 1);
+			return;
+		}
+		partial = rc;
+	}
+
 	c->outlen = c->outoff = 0;
-	out_add(c, "HTTP/1.1 200 OK\r\n");
+	out_add(c, "HTTP/1.1 %s\r\n",
+	        partial ? "206 Partial Content" : "200 OK");
 	out_add(c, "Date: %s\r\n", date);
 	out_add(c, "Last-Modified: %s\r\n", lmod);
 	out_add(c, "Content-Type: %s\r\n", ctype(served));
-	out_add(c, "Content-Length: %lld\r\n", (long long)st.st_size);
+	out_add(c, "Accept-Ranges: bytes\r\n");
+	if (partial)
+		out_add(c, "Content-Range: bytes %lld-%lld/%lld\r\n",
+		        (long long)first, (long long)last,
+		        (long long)st.st_size);
+	out_add(c, "Content-Length: %lld\r\n",
+	        partial ? (long long)(last - first + 1)
+	                : (long long)st.st_size);
 	out_add(c, "Connection: close\r\n\r\n");
 
 	c->filefd = fd;
-	c->fileoff = 0;
-	c->fileend = st.st_size;
+	c->fileoff = partial ? first : 0;
+	c->fileend = partial ? last + 1 : st.st_size;
 
 	/* HEAD. RFC 9110 9.3.2: the response is identical to the GET
 	 * response except that there is no body. Identical means the
