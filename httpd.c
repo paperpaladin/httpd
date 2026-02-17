@@ -27,8 +27,12 @@
 #define INBUF     8192    /* header section limit; also the read buffer */
 #define OUTBUF    65536
 #define MAXTARGET 2048
+#define MAXBODY   (1 << 20)   /* a GET body this server will read and discard */
 
-enum state { S_HEAD, S_WRITE, S_DONE };
+enum state { S_HEAD, S_BODY, S_WRITE, S_DONE };
+
+/* Where the chunked-body drainer is in RFC 9112 7.1's grammar. */
+enum chunk_state { CH_SIZE, CH_DATA, CH_CRLF, CH_TRAILER };
 
 struct conn {
 	int   fd;
@@ -38,6 +42,11 @@ struct conn {
 	char  out[OUTBUF];
 	size_t outlen, outoff;
 	int   closing;        /* send this response, then hang up */
+	int   body_mode;      /* 0 none, 1 Content-Length, 2 chunked */
+	long long body_left;  /* Content-Length bytes still to discard */
+	long long body_total; /* chunked: total payload seen, against MAXBODY */
+	long long ch_left;    /* chunked: bytes left in the current chunk */
+	int   ch_state;
 	int   filefd;         /* body source, or -1 */
 	off_t fileoff, fileend;
 	time_t last;          /* for the idle timeout */
@@ -110,6 +119,15 @@ static void reply(struct conn *c, int code, const char *reason,
 {
 	char body[128], date[64];
 	int blen;
+
+	/* A prepared 200 can be overwritten by a 400 from the body drainer,
+	 * and its descriptor would leak once per request if this were not
+	 * here. */
+	if (c->filefd >= 0) {
+		close(c->filefd);
+		c->filefd = -1;
+	}
+	c->fileoff = c->fileend = 0;
 
 	blen = snprintf(body, sizeof body, "%d %s\n", code, reason);
 	date_hdr(date, sizeof date, time(NULL));
@@ -725,18 +743,124 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	c->state = S_WRITE;
 }
 
+/* ---- request bodies (RFC 9112 6 and 7) ----------------------------------- */
+/*
+ * GET and HEAD are the only methods here, and neither has any use for a
+ * body -- but a body that is not read is not gone. It sits in the socket and
+ * becomes the next request on a keep-alive connection, which is the second
+ * half of request smuggling. So it is read and discarded, and anything
+ * malformed in its framing is a 400 that closes the connection.
+ *
+ * The response is built BEFORE the body is drained, because it does not
+ * depend on it, and sent AFTER -- a server that answers before reading the
+ * request tends to find the client has stopped reading. A drain error
+ * overwrites the prepared response.
+ */
+static void consume(struct conn *c, size_t n)
+{
+	memmove(c->in, c->in + n, c->inlen - n);
+	c->inlen -= n;
+}
+
+/* 0 need more bytes, 1 done, otherwise the status code to refuse with. */
+static int drain_body(struct conn *c)
+{
+	if (c->body_mode == 1) {
+		size_t take = c->inlen < (size_t)c->body_left
+		            ? c->inlen : (size_t)c->body_left;
+
+		consume(c, take);
+		c->body_left -= (long long)take;
+		return c->body_left == 0;
+	}
+
+	for (;;) {
+		char *nl;
+		size_t n, take;
+
+		switch (c->ch_state) {
+		case CH_SIZE:
+			nl = memmem(c->in, c->inlen, "\r\n", 2);
+			if (!nl)      /* a chunk-size line cannot be this long */
+				return c->inlen > 80 ? 400 : 0;
+			n = (size_t)(nl - c->in);
+			/* The same 80-byte ceiling has to apply when the CRLF
+			 * HAS arrived, or an 83-digit chunk size padded with
+			 * leading zeros parses fine and the cap above only
+			 * catches a client that never sends the CRLF at all.
+			 * Found by the assertion for exactly that. */
+			if (n > 80) return 400;
+			{
+				long long sz = 0;
+				size_t i;
+
+				for (i = 0; i < n; i++) {
+					int h;
+
+					/* chunk-ext, which is legal and
+					 * ignored. */
+					if (c->in[i] == ';') break;
+					h = hexval((unsigned char)c->in[i]);
+					if (h < 0) return 400;
+					/* A chunk size that overflows is the
+					 * oldest chunked-encoding bug there
+					 * is. */
+					if (sz > (LLONG_MAX - h) / 16)
+						return 400;
+					sz = sz * 16 + h;
+				}
+				if (i == 0) return 400;   /* no hex digits */
+				if (i > 16) return 400;   /* cannot be 64-bit */
+				consume(c, n + 2);
+				c->body_total += sz;
+				if (c->body_total > MAXBODY) return 413;
+				c->ch_left = sz;
+				c->ch_state = sz ? CH_DATA : CH_TRAILER;
+			}
+			break;
+
+		case CH_DATA:
+			take = c->inlen < (size_t)c->ch_left
+			     ? c->inlen : (size_t)c->ch_left;
+			consume(c, take);
+			c->ch_left -= (long long)take;
+			if (c->ch_left) return 0;
+			c->ch_state = CH_CRLF;
+			break;
+
+		case CH_CRLF:
+			if (c->inlen < 2) return 0;
+			if (c->in[0] != '\r' || c->in[1] != '\n') return 400;
+			consume(c, 2);
+			c->ch_state = CH_SIZE;
+			break;
+
+		default:  /* CH_TRAILER: fields, then an empty line */
+			nl = memmem(c->in, c->inlen, "\r\n", 2);
+			if (!nl)
+				return c->inlen > INBUF / 2 ? 400 : 0;
+			n = (size_t)(nl - c->in);
+			consume(c, n + 2);
+			if (n == 0) return 1;
+			break;
+		}
+	}
+}
+
 /* ---- request handling ---------------------------------------------------- */
 
 static void handle(struct conn *c)
 {
 	char *eoh, *line, *nl;
 	char empty[1] = "", path[PATH_MAX];
+	size_t headlen;
 	struct req r;
 	int code;
 
 	memset(&r, 0, sizeof r);
 
 	eoh = memmem(c->in, c->inlen, "\r\n\r\n", 4);
+	headlen = (size_t)(eoh - c->in) + 4;
 
 	/* A NUL anywhere in the header section. Everything after this point
 	 * treats the section as C strings, so a NUL would silently truncate a
@@ -784,6 +908,33 @@ static void handle(struct conn *c)
 		return;
 	}
 	serve(c, &r, path);
+
+	/* The response is in c->out. Now the body, if the request declared
+	 * one: drop the header section and let the drainer run. */
+	consume(c, headlen);
+	headlen = 0;
+	if (r.clen > MAXBODY) {
+		reply(c, 413, "Content Too Large", NULL, 1);
+		return;
+	}
+	if (r.te_chunked) {
+		c->body_mode = 2;
+		c->ch_state = CH_SIZE;
+	} else if (r.clen > 0) {
+		c->body_mode = 1;
+		c->body_left = r.clen;
+	} else {
+		return;                  /* no body: c->state is S_WRITE */
+	}
+
+	code = drain_body(c);
+	if (code > 1) {
+		reply(c, code, code == 413 ? "Content Too Large"
+		                           : "Bad Request", NULL, 1);
+		c->body_mode = 0;
+	} else if (code == 0) {
+		c->state = S_BODY;       /* wait for the rest of it */
+	}
 }
 
 /* ---- the state machine --------------------------------------------------- */
@@ -806,6 +957,24 @@ static void on_readable(int i)
 	}
 	c->inlen += (size_t)n;
 	c->last = time(NULL);
+
+	if (c->state == S_BODY) {
+		int code = drain_body(c);
+
+		if (code > 1) {
+			reply(c, code, code == 413 ? "Content Too Large"
+			                           : "Bad Request", NULL, 1);
+			c->body_mode = 0;
+		} else if (code == 1) {
+			c->state = S_WRITE;
+		} else if (c->inlen == INBUF - 1) {
+			/* The drainer could not make progress on a full
+			 * buffer: a chunk-size line or a trailer field longer
+			 * than the whole buffer. */
+			reply(c, 400, "Bad Request", NULL, 1);
+		}
+		return;
+	}
 
 	if (memmem(c->in, c->inlen, "\r\n\r\n", 4))
 		handle(c);

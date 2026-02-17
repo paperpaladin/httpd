@@ -706,6 +706,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 11. request bodies: Content-Length and chunked
+#
+# GET has no use for a body, but a body that is not read is not gone: it
+# stays in the socket and becomes the next request on a keep-alive
+# connection. curl is the oracle for well-formed chunked framing -- given
+# Transfer-Encoding: chunked it does the chunking itself -- and raw.py for
+# the malformed cases.
+# ---------------------------------------------------------------------------
+tstatus 'body: CL body on GET'     200 /ok.txt -X GET -d 'hello world'
+tstatus 'body: empty CL body'      200 /ok.txt -X GET -d ''
+tstatus 'body: curl chunks it'     200 /ok.txt -X GET \
+        -H 'Transfer-Encoding: chunked' -d 'hello world'
+# 2MB through curl's chunker: more than one read, and over MAXBODY.
+head -c 2097152 "$BIG" > "$TD/2mb"
+tstatus 'body: 2MB chunked is 413'  413 /ok.txt -X GET \
+        -H 'Transfer-Encoding: chunked' --data-binary "@$TD/2mb"
+tstatus 'body: 2MB CL is 413'       413 /ok.txt -X GET \
+        --data-binary "@$TD/2mb"
+# Just under the cap must still be served, or the 413 above proves nothing.
+head -c 1000000 "$BIG" > "$TD/1mb"
+tstatus 'body: 1MB chunked is 200'  200 /ok.txt -X GET \
+        -H 'Transfer-Encoding: chunked' --data-binary "@$TD/1mb"
+
+traw 'chunked, one chunk'       200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+traw 'chunked, several chunks'  200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n2\r\nbc\r\n3\r\ndef\r\n0\r\n\r\n"
+traw 'chunked, upper-case hex'  200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n"
+traw 'chunked, chunk-ext'       200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;name=value\r\nhello\r\n0\r\n\r\n"
+traw 'chunked, with trailer'    200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n"
+traw 'chunked, empty body'      200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+
+traw 'chunk size not hex'       400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
+traw 'chunk size empty'         400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\r\nhello\r\n0\r\n\r\n"
+traw 'chunk size negative'      400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n-5\r\nhello\r\n0\r\n\r\n"
+# 17 hex digits: overflows a 64-bit size. The check is on the accumulator,
+# before the multiply, so it cannot wrap.
+traw 'chunk size overflows'     400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffff\r\nx\r\n0\r\n\r\n"
+traw 'chunk size huge but sane' 413 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n7fffffff\r\nx\r\n"
+traw 'no CRLF after chunk data' 400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n"
+traw 'chunk-size line too long' 400 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n000000000000000000000000000000000000000000000000000000000000000000000000000000000005\r\nhello\r\n0\r\n\r\n"
+
+# An unterminated chunked body: no final zero chunk, and the peer closes.
+# The server must not answer, and must not die. raw.py exits 3 when nothing
+# came back.
+printf '%b' "GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n" \
+	| python3 "$ROOT/t/raw.py" "$PORT" >"$TD/raw" 2>&1
+_rc=$?
+if [ "$_rc" = 3 ] && [ ! -s "$TD/raw" ]; then
+	ok 'raw: unterminated chunked gets no response'
+else
+	bad 'raw: unterminated chunked gets no response' \
+	    "raw.py exit $_rc, output: $(head -c 200 "$TD/raw")"
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
