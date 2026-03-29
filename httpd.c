@@ -42,6 +42,7 @@ struct conn {
 	char  out[OUTBUF];
 	size_t outlen, outoff;
 	int   closing;        /* send this response, then hang up */
+	int   keep;           /* this request may be followed by another */
 	int   body_mode;      /* 0 none, 1 Content-Length, 2 chunked */
 	long long body_left;  /* Content-Length bytes still to discard */
 	long long body_total; /* chunked: total payload seen, against MAXBODY */
@@ -139,7 +140,8 @@ static void reply(struct conn *c, int code, const char *reason,
 	out_add(c, "Content-Length: %d\r\n", blen);
 	if (extra)
 		out_add(c, "%s", extra);
-	out_add(c, "Connection: %s\r\n\r\n", close_now ? "close" : "keep-alive");
+	out_add(c, "Connection: %s\r\n\r\n",
+	        close_now ? "close" : "keep-alive");
 	out_add(c, "%s", body);
 
 	c->closing = close_now;
@@ -683,9 +685,10 @@ static void serve(struct conn *c, struct req *r, const char *path)
 			out_add(c, "Last-Modified: %s\r\n", lmod);
 			/* No Content-Length and no body: a 304 that claims a
 			 * length desynchronises a keep-alive connection. */
-			out_add(c, "Connection: close\r\n\r\n");
+			out_add(c, "Connection: %s\r\n\r\n",
+			        c->keep ? "keep-alive" : "close");
 			c->filefd = -1;
-			c->closing = 1;
+			c->closing = !c->keep;
 			c->state = S_WRITE;
 			return;
 		}
@@ -723,7 +726,8 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	out_add(c, "Content-Length: %lld\r\n",
 	        partial ? (long long)(last - first + 1)
 	                : (long long)st.st_size);
-	out_add(c, "Connection: close\r\n\r\n");
+	out_add(c, "Connection: %s\r\n\r\n",
+	        c->keep ? "keep-alive" : "close");
 
 	c->filefd = fd;
 	c->fileoff = partial ? first : 0;
@@ -739,7 +743,7 @@ static void serve(struct conn *c, struct req *r, const char *path)
 		c->filefd = -1;
 		c->fileend = 0;
 	}
-	c->closing = 1;
+	c->closing = !c->keep;
 	c->state = S_WRITE;
 }
 
@@ -894,6 +898,21 @@ static void handle(struct conn *c)
 		return;
 	}
 
+	/*
+	 * Persistence. RFC 9112 9.3: HTTP/1.1 is persistent unless the
+	 * request says "Connection: close"; HTTP/1.0 is the other way round
+	 * and needs an explicit "keep-alive". Everything that refuses the
+	 * request closes regardless -- once the framing is in doubt, the
+	 * bytes after this request cannot be assumed to be another one.
+	 */
+	c->keep = r.minor >= 1 ? !r.want_close : r.want_keep;
+
+	/* Note that every refusal from here down closes the connection, even
+	 * the harmless-looking ones. They return before the body drainer has
+	 * run, so the request's body -- if it had one -- is still in the
+	 * socket, and keeping the connection open would mean reading it as
+	 * the next request. 404 and 405 are not framing errors, but they are
+	 * answered before the framing has been dealt with. */
 	if (strcmp(r.method, "GET") != 0 && strcmp(r.method, "HEAD") != 0) {
 		reply(c, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n", 1);
 		return;
@@ -1005,7 +1024,29 @@ static void on_writable(int i)
 		refill(c);                  /* more of the body */
 		return;
 	}
-	c->state = S_DONE;
+	if (c->filefd >= 0) {
+		close(c->filefd);
+		c->filefd = -1;
+	}
+	if (c->closing) {
+		c->state = S_DONE;
+		return;
+	}
+
+	/* Keep-alive: the same connection, a fresh request. Everything that
+	 * described the last one is cleared here; c->in is NOT, because
+	 * anything still in it is the next request. A client is allowed to
+	 * send several without waiting, so if a whole one is already
+	 * buffered it is answered now rather than after another poll(2). */
+	c->outlen = c->outoff = 0;
+	c->fileoff = c->fileend = 0;
+	c->body_mode = 0;
+	c->body_left = c->body_total = c->ch_left = 0;
+	c->ch_state = CH_SIZE;
+	c->keep = 0;
+	c->state = S_HEAD;
+	if (memmem(c->in, c->inlen, "\r\n\r\n", 4))
+		handle(c);
 }
 
 static int listen_on(const char *addr, int port)
