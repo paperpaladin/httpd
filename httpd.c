@@ -50,7 +50,8 @@ struct conn {
 	int   ch_state;
 	int   filefd;         /* body source, or -1 */
 	off_t fileoff, fileend;
-	time_t last;          /* for the idle timeout */
+	time_t last;          /* last progress of any kind */
+	time_t rstart;        /* when the current request started arriving */
 };
 
 /* One parsed request. Points into conn.in, which is NUL-punched in place. */
@@ -1044,6 +1045,7 @@ static void on_writable(int i)
 	c->body_left = c->body_total = c->ch_left = 0;
 	c->ch_state = CH_SIZE;
 	c->keep = 0;
+	c->rstart = time(NULL);
 	c->state = S_HEAD;
 	if (memmem(c->in, c->inlen, "\r\n\r\n", 4))
 		handle(c);
@@ -1158,17 +1160,43 @@ int main(int argc, char **argv)
 				conns[nconn].fd = cfd;
 				conns[nconn].filefd = -1;
 				conns[nconn].state = S_HEAD;
-				conns[nconn].last = time(NULL);
+				conns[nconn].last = conns[nconn].rstart = time(NULL);
 				nconn++;
 			}
 		}
 
-		/* Idle reaping. A client that opens a connection and says
-		 * nothing, or dribbles one byte a minute, holds a slot
-		 * otherwise. */
+		/*
+		 * Reaping, and the distinction here is the whole slow-loris
+		 * answer. A plain idle timeout -- "close if nothing has
+		 * arrived for N seconds" -- does not stop a loris at all,
+		 * because one byte every N-1 seconds resets it forever. So
+		 * while a request is still arriving, the deadline is on the
+		 * REQUEST: it must be complete within idle_timeout seconds of
+		 * its first byte, however busily the client dribbles.
+		 *
+		 * While a response is being written the deadline is the
+		 * ordinary idle one, measured from the last byte that moved,
+		 * because a large body legitimately takes a long time and a
+		 * slow reader is a customer rather than an attack.
+		 */
 		now = time(NULL);
-		for (i = nconn - 1; i >= 0; i--)
-			if (now - conns[i].last > idle_timeout)
-				conn_close(i);
+		for (i = nconn - 1; i >= 0; i--) {
+			struct conn *c = &conns[i];
+
+			if (c->state == S_WRITE) {
+				if (now - c->last > idle_timeout)
+					conn_close(i);
+			} else if (now - c->rstart > idle_timeout) {
+				if (c->inlen == 0) {
+					/* An idle keep-alive connection that
+					 * never started another request.
+					 * Nothing to answer; just close. */
+					conn_close(i);
+				} else {
+					reply(c, 408, "Request Timeout",
+					      NULL, 1);
+				}
+			}
+		}
 	}
 }

@@ -951,6 +951,103 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 14. slow loris, and the reaping rule
+#
+# These need a server with a one-second deadline, so there is a second
+# instance on its own ephemeral port. Both are killed from the trap.
+#
+# The rule being asserted: while a request is still arriving the deadline is
+# on the REQUEST, not on inactivity. A plain idle timeout does not stop a
+# loris, because one byte every N-1 seconds resets it forever.
+# ---------------------------------------------------------------------------
+"$HTTPD" -r "$R" -t 1 >"$TD/port2" 2>"$TD/log2" &
+SRV2=$!
+trap 'kill "$SRV" "$SRV2" 2>/dev/null; wait "$SRV" "$SRV2" 2>/dev/null' \
+	EXIT INT TERM
+PORT2=
+i=0
+while [ "$i" -lt 100 ]; do
+	PORT2=$(sed -n 's/^listening [0-9.]*:\([0-9][0-9]*\)$/\1/p' "$TD/port2")
+	[ -n "$PORT2" ] && break
+	sleep 0.05
+	i=$((i + 1))
+done
+if [ -z "$PORT2" ]; then
+	bad 'loris: second server started' "$(cat "$TD/log2")"
+else
+	ok 'loris: second server started'
+
+	# raw2 REQUEST [args...] -- against the -t 1 server
+	raw2() {
+		_q=$1; shift
+		printf '%b' "$_q" \
+			| python3 "$ROOT/t/raw.py" "$PORT2" "$@" \
+			  >"$TD/raw2" 2>"$TD/raw2err"
+		RST2=$(sed -n '1s|^HTTP/1\.[01] \([0-9][0-9]*\).*|\1|p' \
+		       "$TD/raw2" | tr -d '\r')
+	}
+	REQ="GET /ok.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+
+	# Control first: the -t 1 server answers a normal request, and
+	# answers one dripped fast enough to beat the deadline. Without
+	# these two, "the loris was refused" is also true of a server that
+	# refuses everything.
+	raw2 "$REQ"
+	if [ "$RST2" = 200 ]; then ok 'loris: fast request is 200'
+	else bad 'loris: fast request is 200' "got [$RST2]"; fi
+
+	raw2 "$REQ" --drip 5
+	if [ "$RST2" = 200 ]; then ok 'loris: 5ms/byte drip is 200'
+	else bad 'loris: 5ms/byte drip is 200' "got [$RST2]"; fi
+
+	# The loris: 38 bytes at 60ms is 2.3 seconds, which is past the
+	# one-second deadline even though the connection is never idle for
+	# more than 60ms. 408, or a close with no response -- both are
+	# refusals, and the assertion is that it is not a 200.
+	raw2 "$REQ" --drip 60
+	if [ "$RST2" = 408 ] || [ -z "$RST2" ]; then
+		ok 'loris: 60ms/byte drip is refused'
+	else
+		bad 'loris: 60ms/byte drip is refused' \
+		    "got [$RST2], which means the deadline was reset by each byte"
+	fi
+
+	# An idle keep-alive connection is reaped. The -t 1 server must drop
+	# it within 3 seconds; the -t 5 server must still be holding it
+	# after 1 second -- the control that stops "CLOSED" from being the
+	# answer to every question.
+	raw2 "$REQ" --linger 3
+	if grep -q CLOSED "$TD/raw2"; then
+		ok 'loris: idle keep-alive reaped at -t 1'
+	else
+		bad 'loris: idle keep-alive reaped at -t 1' \
+		    "$(tail -1 "$TD/raw2")"
+	fi
+	raw "$REQ" --linger 1
+	if grep -q OPEN "$TD/raw"; then
+		ok 'loris: idle keep-alive held at -t 5'
+	else
+		bad 'loris: idle keep-alive held at -t 5' \
+		    "$(tail -1 "$TD/raw")"
+	fi
+
+	# A connection that says nothing at all is reaped too, and silently:
+	# there is no request to answer with 408. raw.py exits 3 when the
+	# server closed without sending a byte.
+	printf '' | python3 "$ROOT/t/raw.py" "$PORT2" --keep --timeout 4 \
+		>"$TD/raw2" 2>&1
+	_rc=$?
+	if [ "$_rc" = 3 ]; then ok 'loris: silent connection reaped'
+	else bad 'loris: silent connection reaped' \
+	         "raw.py exit $_rc, output [$(cat "$TD/raw2")]"; fi
+
+	# And the slow server is still serving afterwards.
+	raw2 "$REQ"
+	if [ "$RST2" = 200 ]; then ok 'loris: still serving after all that'
+	else bad 'loris: still serving after all that' "got [$RST2]"; fi
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
