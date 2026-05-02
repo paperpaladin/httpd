@@ -1048,6 +1048,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 15. nothing on stderr
+#
+# Under `make test-asan` this is where a sanitizer report lands, and a report
+# that does not happen to kill the process would otherwise go unnoticed.
+# Under an ordinary build both logs must simply be empty: this server has no
+# reason to say anything.
+# ---------------------------------------------------------------------------
+if grep -qE 'AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY:' \
+         "$TD/log" "$TD/log2" 2>/dev/null; then
+	bad 'stderr: no sanitizer diagnostics' \
+	    "$(grep -hE -m5 'AddressSanitizer|LeakSanitizer|runtime error|SUMMARY:' "$TD/log" "$TD/log2")"
+elif [ -s "$TD/log" ] || [ -s "$TD/log2" ]; then
+	bad 'stderr: both servers stayed quiet' \
+	    "$(head -c 400 "$TD/log")$(head -c 400 "$TD/log2")"
+else
+	ok 'stderr: both servers stayed quiet'
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'

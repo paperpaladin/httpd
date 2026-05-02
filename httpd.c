@@ -79,6 +79,10 @@ static int idle_timeout = 10;   /* seconds; -t changes it */
 static char docroot[PATH_MAX];
 static size_t docroot_len;
 
+static volatile sig_atomic_t stopping;
+
+static void on_term(int sig) { (void)sig; stopping = 1; }
+
 static void die(const char *m) { perror(m); exit(1); }
 
 /* ---- connection bookkeeping ---------------------------------------------- */
@@ -1089,6 +1093,14 @@ int main(int argc, char **argv)
 	/* Writing to a peer that has closed must be an errno, not a death. */
 	signal(SIGPIPE, SIG_IGN);
 
+	/* An orderly exit on SIGTERM is not politeness. LeakSanitizer only
+	 * runs at normal process exit, so a server that is always killed
+	 * outright is a server whose `make test-asan` can never report a
+	 * leak -- the target would be unable to detect one of the two defect
+	 * classes it exists for. */
+	signal(SIGTERM, on_term);
+	signal(SIGINT, on_term);
+
 	while ((opt = getopt(argc, argv, "a:p:r:t:")) != -1) {
 		switch (opt) {
 		case 'a': addr = optarg; break;
@@ -1116,7 +1128,7 @@ int main(int argc, char **argv)
 
 	lfd = listen_on(addr, port);
 
-	for (;;) {
+	while (!stopping) {
 		int n, i;
 		time_t now;
 
@@ -1199,4 +1211,8 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+
+	while (nconn) conn_close(nconn - 1);
+	close(lfd);
+	return 0;
 }
