@@ -724,6 +724,12 @@ tstatus 'body: 2MB chunked is 413'  413 /ok.txt -X GET \
         -H 'Transfer-Encoding: chunked' --data-binary "@$TD/2mb"
 tstatus 'body: 2MB CL is 413'       413 /ok.txt -X GET \
         --data-binary "@$TD/2mb"
+# Both of those are also the assertion for the lingering close. The server
+# answers 413 while curl is still sending, and close(2) on a socket with
+# unread data in its receive queue makes the kernel send RST -- which
+# discards the response that was already on its way. Without the
+# shutdown-and-drain, curl reports "(55) Send failure: Connection reset by
+# peer" here and never sees the 413.
 # Just under the cap must still be served, or the 413 above proves nothing.
 head -c 1000000 "$BIG" > "$TD/1mb"
 tstatus 'body: 1MB chunked is 200'  200 /ok.txt -X GET \
@@ -1000,11 +1006,18 @@ else
 	if [ "$RST2" = 200 ]; then ok 'loris: 5ms/byte drip is 200'
 	else bad 'loris: 5ms/byte drip is 200' "got [$RST2]"; fi
 
-	# The loris: 38 bytes at 60ms is 2.3 seconds, which is past the
-	# one-second deadline even though the connection is never idle for
-	# more than 60ms. 408, or a close with no response -- both are
+	# The loris: 38 bytes at 100ms apiece is 3.8 seconds, which is past
+	# the one-second deadline even though the connection is never idle
+	# for more than 100ms. 408, or a close with no response -- both are
 	# refusals, and the assertion is that it is not a 200.
-	raw2 "$REQ" --drip 60
+	#
+	# 100ms and not 60ms: the deadline is checked against time(2) in
+	# whole seconds, so with -t 1 it can fire anywhere between 1.0 and
+	# 2.0 seconds after the first byte. At 60ms the request finished at
+	# 2.16s, which left 160ms of margin and failed intermittently under
+	# load. The deadline is the thing under test, not the clock's
+	# resolution.
+	raw2 "$REQ" --drip 100
 	if [ "$RST2" = 408 ] || [ -z "$RST2" ]; then
 		ok 'loris: 60ms/byte drip is refused'
 	else

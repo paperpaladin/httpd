@@ -242,6 +242,11 @@ source naming its upgrade path)
   CRLF, so an LF-only request is not malformed here, it simply never completes
   and is reaped by the request deadline.
 - **No `Server` header.** Not a feature, just nothing to say.
+- **A closing connection lingers** before `close(2)`: the write side is shut
+  down and the rest of the client's request is read and discarded, bounded by
+  `-t` and by 1MiB. Without it, `close(2)` on a socket with unread data makes
+  the kernel send RST, which discards the response -- so the client of a
+  refused 2MB upload got "connection reset by peer" instead of the 413.
 
 **Slow loris: yes, it times out.** The answer is a deadline on the *request*,
 not a timeout on inactivity. A plain idle timeout does not stop a loris at
@@ -270,6 +275,11 @@ still answers a normal request and one dripped at 5ms per byte.
   RFC 9110 14.2. An unknown unit, a missing `=`, non-numeric or reversed
   positions all mean "send the whole thing". A `last-byte-pos` past the end of
   the file is neither: it is clamped.
+- **`close(2)` on a socket with unread data sends RST**, and the RST discards
+  any part of the response the client has not read yet. A 413 or a 400 to a
+  client that is still uploading is therefore lost unless the server shuts
+  down the write side and drains first. The suite reported this as an
+  intermittent failure before it was understood as a defect.
 - **`open(2)` on a FIFO with `O_RDONLY` blocks** until a writer appears. One
   request for one fifo inside the document root wedged the whole
   single-process server; `make test` hung instead of failing. `O_NONBLOCK`.
