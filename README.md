@@ -28,30 +28,30 @@ by whoever is talking to it and ends up in `open(2)`. One statement has to be
 true, and the rest of this section is about how it is made true and how it is
 proved:
 
-> **No request can cause a byte to be read from outside the document root.**
+> No request can cause a byte to be read from outside the document root.
 
 ### Three layers, because each one alone has a hole
 
-1. **Percent-decoding happens exactly once.** `%2e%2e%2f` becomes `../` and is
+1. Percent-decoding happens exactly once. `%2e%2e%2f` becomes `../` and is
    then caught by layer 2. `%252e%252e%252f` becomes the literal nine-byte
-   segment `%2e%2e%2f`, which is a filename and not a traversal -- so the
-   correct answer for the double-encoded form is **404**, because no such file
+   segment `%2e%2e%2f`, which is a filename and not a traversal, so the
+   correct answer for the double-encoded form is 404, because no such file
    exists. Decoding in a loop until the string stops changing is the bug that
    makes double encoding work, so there is no loop.
-2. **A `..` segment is refused, not popped.** Popping is what a normaliser
+2. A `..` segment is refused, not popped. Popping is what a normaliser
    does, and a normaliser has to be correct about every encoding of every
    separator in order to be safe. Refusing has to be correct about one string.
    Any segment beginning with `.` is refused as well, which is also the
    no-dotfiles rule.
-3. **`realpath(3)` containment.** The resolved path must still begin with the
+3. `realpath(3)` containment. The resolved path must still begin with the
    document root, which is itself `realpath`'d once at startup. This is the
    only layer that can see a symlink: there is nothing hostile in the string
    `/escape`.
 
 ### The oracle: a secret file outside the root
 
-`t/run.sh` writes `SUPERSECRET-5f3a9c-DO-NOT-SERVE` into a file **outside** the
-document root, puts a symlink to it **inside** the root, and puts a second
+`t/run.sh` writes `SUPERSECRET-5f3a9c-DO-NOT-SERVE` into a file outside the
+document root, puts a symlink to it inside the root, and puts a second
 symlink to the whole parent directory inside the root as well. Every refusal
 assertion checks two things: a refusing status code, and that the secret string
 is not in the response body. A 200 with the wrong body and a 403 with the right
@@ -102,7 +102,7 @@ refused.
 | `/nodir/` (directory, no index.html) | 403 | `serve: dir with no index` |
 | `/fifo` (a FIFO inside the root) | 403 | `serve: a fifo is not a doc` |
 
-A symlink that stays **inside** the root is served (`serve: symlink inside
+A symlink that stays inside the root is served (`serve: symlink inside
 root`), because it is a document and not an escape. Fifteen assertions for what
 the resolver must still serve come before the refusals in the file, for the
 reason that a resolver which refuses everything satisfies every refusal test
@@ -112,12 +112,12 @@ ever written.
 
 Two refusals, both from RFC 9112:
 
-- **Content-Length together with Transfer-Encoding** is 400, in both field
+- Content-Length together with Transfer-Encoding is 400, in both field
   orders. Section 6.1 permits resolving it in favour of Transfer-Encoding and
-  6.3 says such a message "ought to be handled as an error"; it is an error
+  6.3 says such a message "ought to be handled as an error". It is an error
   here, because one hop frames the message by one field and the next hop by
   the other.
-- **Whitespace before the colon** in a header line is 400, as section 5.1
+- Whitespace before the colon in a header line is 400, as section 5.1
   requires. `Host : evil` is not a field named `Host ` and is not normalised
   into `Host`: it is a malformed line. An intermediary that trims the space
   and a server that does not now disagree about the Host of the request.
@@ -128,8 +128,8 @@ overflow `strtoll`, obs-fold continuation lines, a bare CR or LF surviving
 inside a field value, a NUL anywhere in the header section, and a missing or
 duplicated `Host` on HTTP/1.1.
 
-And the other half of smuggling: the request **body** is read and discarded
-even for GET, because a body that is not read is not gone -- it stays in the
+And the other half of smuggling: the request body is read and discarded
+even for GET, because a body that is not read is not gone. It stays in the
 socket and becomes the next request on a keep-alive connection. The assertion
 `pipeline: body is not a request` sends a request whose 39-byte body reads
 `GET /sub/deep.txt HTTP/1.1...` and requires exactly one response.
@@ -142,14 +142,14 @@ Three mutants were built and run through the whole suite:
 | --- | --- |
 | delete the `realpath(3)` containment check | **caught**: 3 failures, including `deny: secret never served` with the secret in a body |
 | delete both the containment check and the `..` refusal | **caught**: the secret is served with 200 |
-| delete the `..` refusal alone | **SURVIVES** -- all assertions pass |
+| delete the `..` refusal alone | **SURVIVES**, all assertions pass |
 
 The surviving mutant is honest and expected: layer 3 catches every `..` case
 the suite can construct, because `realpath` either resolves outside the root
 (403) or fails (404). Layer 2 is kept anyway, because it refuses before
 touching the filesystem at all and because it makes the refusal independent of
 `realpath(3)` being right. If you want a test that fails when layer 2 is
-removed, it has to be one where `realpath` succeeds inside the root -- the
+removed, it has to be one where `realpath` succeeds inside the root: the
 stricter-than-necessary refusal of `/sub/../ok.txt`.
 
 ## The oracle
@@ -160,7 +160,7 @@ reports, the header block curl saved, or the bytes curl wrote to a file.
 Nothing in the suite inspects httpd's memory or trusts it about anything.
 
 Four other outside authorities are used where curl cannot answer. The table
-below lists five rows, and the first is curl itself -- `raw.py` is ours, which
+below lists five rows, and the first is curl itself, `raw.py` is ours, which
 the section above says plainly, so it is not among them:
 
 | Oracle | What it decides | Why it is independent |
@@ -170,7 +170,7 @@ the section above says plainly, so it is not among them:
 | `file(1)` | Content-Type for 4 fixtures | reads the file's **content**; httpd reads its **name** |
 | `date(1)` | the `Last-Modified` value | formats the same mtime through different code |
 | `/proc/PID/status` | SIGPIPE is ignored | the kernel's own view of the live process |
-| `t/raw.py` | malformed requests | **ours**, and therefore the weakest -- see below |
+| `t/raw.py` | malformed requests | **ours**, and therefore the weakest, see below |
 
 `t/raw.py` exists because curl is a correct client: it will not put a space
 before a colon, send two conflicting `Content-Length` headers, or dribble a
@@ -186,121 +186,121 @@ that no status code can make.
 
 This list is longer than the feature list, on purpose.
 
-**Not implemented at all**
+Not implemented at all
 
-- **TLS.** No `https`. Put it behind something that does TLS, or do not.
-- **CGI, PHP, FastCGI, proxying, rewriting, redirects.** Files only. There is
+- TLS. No `https`. Put it behind something that does TLS, or do not.
+- CGI, PHP, FastCGI, proxying, rewriting, redirects. Files only. There is
   not even a 301 from `/sub` to `/sub/`: both serve the same `index.html`,
   which is wrong in the strict sense that relative links in that document
   resolve differently, and is not fixed.
-- **Virtual hosting.** `Host` is required on HTTP/1.1 and then ignored
+- Virtual hosting. `Host` is required on HTTP/1.1 and then ignored
   completely. Two names pointing here serve the same tree.
-- **Directory listings.** A directory with no `index.html` is 403. A generated
+- Directory listings. A directory with no `index.html` is 403. A generated
   listing is a disclosure feature.
-- **ETags and `If-None-Match`, `If-Range`, `If-Unmodified-Since`,
-  `If-Match`.** `If-Modified-Since` is the only conditional.
-- **Compression.** No `Content-Encoding`, no precompressed `.gz` lookup.
+- ETags and `If-None-Match`, `If-Range`, `If-Unmodified-Since`,
+  `If-Match`. `If-Modified-Since` is the only conditional.
+- Compression. No `Content-Encoding`, no precompressed `.gz` lookup.
   `Accept-Encoding` is ignored.
-- **`Content-Type` charset.** Never sent. A guessed charset is a claim about
+- `Content-Type` charset. Never sent. A guessed charset is a claim about
   bytes nothing here has looked at, and a client told the wrong charset trusts
   it over its own detection.
-- **Caching headers.** No `Cache-Control`, no `Expires`.
-- **Access logging.** Nothing is written to stdout after the port line, and
+- Caching headers. No `Cache-Control`, no `Expires`.
+- Access logging. Nothing is written to stdout after the port line, and
   the suite asserts stderr stays empty.
-- **IPv6.** `-a` takes an IPv4 literal; the socket is `AF_INET`.
-- **Methods other than GET and HEAD.** Everything else is 405 with
+- IPv6. `-a` takes an IPv4 literal. The socket is `AF_INET`.
+- Methods other than GET and HEAD. Everything else is 405 with
   `Allow: GET, HEAD`, including methods the server has never heard of, where
   RFC 9110 would prefer 501. The distinction is not observable here, since
   nothing is implemented for any of them.
 
-**Implemented, with a ceiling** (each one is a `shortcut:` comment in the
+Implemented, with a ceiling (each one is a `shortcut:` comment in the
 source naming its upgrade path)
 
-- **One process, one thread.** One CPU's worth of throughput. The upgrade is
+- One process, one thread. One CPU's worth of throughput. The upgrade is
   `SO_REUSEPORT` plus `fork()`, which changes no parsing.
-- **Multi-range requests are refused with 416.** A single range is fully
+- Multi-range requests are refused with 416. A single range is fully
   supported in all three forms. `multipart/byteranges` needs a boundary
   generator, per-part headers and a second body pump. RFC 9110 14.2 would also
   permit ignoring the `Range` header and answering 200; 416 is the louder
   answer and it is a deliberate deviation.
-- **The MIME table is hard-coded**, fifteen extensions. Not `/etc/mime.types`.
-- **`realpath(3)` is a check on a path, so there is a TOCTOU window** between
+- The MIME table is hard-coded, fifteen extensions. Not `/etc/mime.types`.
+- `realpath(3)` is a check on a path, so there is a TOCTOU window between
   it and `open(2)` in which a path component could be replaced by a symlink.
   Closing it means walking the path with `openat(2)` and `O_NOFOLLOW` one
   segment at a time. It needs a local attacker with write access *inside* the
   document root, who can already replace the file being served.
-- **The header section must fit in 8191 bytes** (431 otherwise) and the
+- The header section must fit in 8191 bytes (431 otherwise) and the
   request target in 2048 (414). A request body is read and discarded up to
   1MiB, over which it is 413.
-- **256 connections**, a compile-time constant. Past that, new connections sit
+- 256 connections, a compile-time constant. Past that, new connections sit
   in the listen backlog until a slot frees.
-- **A refusal always closes the connection**, including 404 and 405. Those are
+- A refusal always closes the connection, including 404 and 405. Those are
   answered before the body drainer has run, so the request's body may still be
   in the socket and keeping the connection open would mean reading it as the
   next request. Observable: curl opens a second connection after a 404
   (`keep: 404 closes`).
-- **A bare-LF line ending is not accepted** anywhere. RFC 9112 2.2 permits a
+- A bare-LF line ending is not accepted anywhere. RFC 9112 2.2 permits a
   recipient to recognise a lone LF as a line terminator; this one requires
   CRLF, so an LF-only request is not malformed here, it simply never completes
   and is reaped by the request deadline.
-- **No `Server` header.** Not a feature, just nothing to say.
-- **A closing connection lingers** before `close(2)`: the write side is shut
+- No `Server` header. Not a feature, just nothing to say.
+- A closing connection lingers before `close(2)`: the write side is shut
   down and the rest of the client's request is read and discarded, bounded by
   `-t` and by 1MiB. Without it, `close(2)` on a socket with unread data makes
-  the kernel send RST, which discards the response -- so the client of a
+  the kernel send RST, which discards the response, so the client of a
   refused 2MB upload got "connection reset by peer" instead of the 413.
 
-**Slow loris: yes, it times out.** The answer is a deadline on the *request*,
+Slow loris: yes, it times out. The answer is a deadline on the *request*,
 not a timeout on inactivity. A plain idle timeout does not stop a loris at
 all, because one byte every N-1 seconds resets it forever. So while a request
 is still arriving it must be complete within `-t` seconds of its first byte,
 however busily the client dribbles, and past that it gets 408. While a
 *response* is being written the deadline is the ordinary idle one measured
 from the last byte that moved, because a 10MB body legitimately takes a while
-and a slow reader is a customer rather than an attack. `-t` defaults to 10
+and a slow reader is a customer, not an attack. `-t` defaults to 10
 seconds. Eight assertions, including the two controls that a one-second server
 still answers a normal request and one dripped at 5ms per byte.
 
 ## Where curl or the RFC contradicted an assumption
 
-- **curl normalises `%2e` away.** `curl 'http://h/%2e%2e/secret.txt'`
+- curl normalises `%2e` away. `curl 'http://h/%2e%2e/secret.txt'`
   percent-decodes the `%2e`, removes the resulting dot segment, and sends
-  `GET /secret.txt` -- confirmed with `curl -v`. The traversal assertion was
+  `GET /secret.txt`, confirmed with `curl -v`. The traversal assertion was
   passing on a 404 for a file that does not exist, which is a green test for a
   request that was never made. `--path-as-is` is required. curl does *not* do
   this when the separator is also encoded (`%2e%2e%2f`), which is why only two
   of the ten encoded cases were affected.
-- **An invalid `If-Modified-Since` must be ignored, not refused.** RFC 9110
+- An invalid `If-Modified-Since` must be ignored, not refused. RFC 9110
   13.1.3 is explicit. Everywhere else in this program, something odd on the
-  wire is a 400; here it has to be a 200 with the full body.
-- **A malformed `Range` must be ignored; only an unsatisfiable one is 416.**
+  wire is a 400. Here it has to be a 200 with the full body.
+- A malformed `Range` must be ignored. Only an unsatisfiable one is 416.
   RFC 9110 14.2. An unknown unit, a missing `=`, non-numeric or reversed
   positions all mean "send the whole thing". A `last-byte-pos` past the end of
   the file is neither: it is clamped.
-- **`close(2)` on a socket with unread data sends RST**, and the RST discards
+- `close(2)` on a socket with unread data sends RST, and the RST discards
   any part of the response the client has not read yet. A 413 or a 400 to a
   client that is still uploading is therefore lost unless the server shuts
   down the write side and drains first. The suite reported this as an
   intermittent failure before it was understood as a defect.
-- **`open(2)` on a FIFO with `O_RDONLY` blocks** until a writer appears. One
+- `open(2)` on a FIFO with `O_RDONLY` blocks until a writer appears. One
   request for one fifo inside the document root wedged the whole
   single-process server; `make test` hung instead of failing. `O_NONBLOCK`.
-- **`open(2)` with `O_RDONLY` succeeds on a directory on Linux**, so the
+- `open(2)` with `O_RDONLY` succeeds on a directory on Linux, so the
   `index.html` fallback written behind an `errno == EISDIR` was unreachable
   and `/` returned 403.
-- **`curl -I` writes the header block to `-o` as well as to `-D`**, so
+- `curl -I` writes the header block to `-o` as well as to `-D`, so
   measuring the `-o` file to prove a HEAD response had no body was measuring
   121 bytes of headers.
-- **`curl -H 'Name;'` removes a header** rather than sending an empty one, so
+- `curl -H 'Name;'` removes a header instead of sending an empty one, so
   the "empty If-Modified-Since is ignored" assertion was passing on a request
   that did not contain the field.
-- **`curl` maps `-o` to URLs positionally**, so one `-o /dev/null` in front of
+- `curl` maps `-o` to URLs positionally, so one `-o /dev/null` in front of
   two URLs sends the second body to stdout, where it lands in the middle of
   the `%{num_connects}` digits being parsed.
-- **`$(printf '\r\n')` is `"\r"`.** Command substitution strips trailing
+- `$(printf '\r\n')` is `"\r"`. Command substitution strips trailing
   newlines, so every raw request was sent with bare-CR line endings and the
   server correctly sat waiting for a terminator that never came.
-- **A bare `wait` in the harness waits for the server too**, since it is a
+- A bare `wait` in the harness waits for the server too, since it is a
   background job of the same shell. The suite hung until the outer timeout
   killed it, which is the one thing `make test` promises cannot happen.
 
