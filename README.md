@@ -23,7 +23,7 @@ Pure C11, gcc, no libraries. `poll(2)` and plain sockets.
 
 ## Security
 
-A static file server is a path traversal sink: the request target is chosen
+A static file server is a path traversal sink. The request target is chosen
 by whoever is talking to it and ends up in `open(2)`. One statement has to be
 true, and the rest of this section is about how it is made true and how it is
 proved:
@@ -102,7 +102,7 @@ refused.
 | `/nodir/` (directory, no index.html) | 403 | `serve: dir with no index` |
 | `/fifo` (a FIFO inside the root) | 403 | `serve: a fifo is not a doc` |
 
-A symlink that stays inside the root is served (`serve: symlink inside
+A symlink that stays inside the root is served (`serve. Symlink inside
 root`), because it is a document and not an escape. Fifteen assertions for what
 the resolver must still serve come before the refusals in the file, for the
 reason that a resolver which refuses everything satisfies every refusal test
@@ -131,7 +131,7 @@ duplicated `Host` on HTTP/1.1.
 And the other half of smuggling: the request body is read and discarded
 even for GET, because a body that is not read is not gone. It stays in the
 socket and becomes the next request on a keep-alive connection. The assertion
-`pipeline: body is not a request` sends a request whose 39-byte body reads
+`pipeline. Body is not a request` sends a request whose 39-byte body reads
 `GET /sub/deep.txt HTTP/1.1...` and requires exactly one response.
 
 ### Mutation testing of the security property
@@ -276,7 +276,7 @@ still answers a normal request and one dripped at 5ms per byte.
 - A malformed `Range` must be ignored. Only an unsatisfiable one is 416.
   RFC 9110 14.2. An unknown unit, a missing `=`, non-numeric or reversed
   positions all mean "send the whole thing". A `last-byte-pos` past the end of
-  the file is neither: it is clamped.
+  the file is neither. It is clamped.
 - `close(2)` on a socket with unread data sends RST, and the RST discards
   any part of the response the client has not read yet. A 413 or a 400 to a
   client that is still uploading is therefore lost unless the server shuts
