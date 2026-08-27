@@ -660,6 +660,197 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 9b. entity tags: ETag and If-None-Match
+#
+# The reason this header exists here is the last block of assertions in this
+# section. An HTTP-date carries one second, so a file rewritten twice inside
+# one second is served stale to every client that revalidates by date, and
+# there is nothing If-Modified-Since can do about it. st_mtim.tv_nsec can.
+#
+# curl is the oracle for the protocol dance itself: --etag-save parses the
+# ETag out of the response with curl's own parser and --etag-compare builds
+# the If-None-Match request from it, so neither the reading of the header nor
+# the writing of the request is ours. The comparison rules come from RFC
+# 9110: 13.1.2 for the weak comparison, the "*" form and the list form, and
+# 13.1.3 for "a recipient MUST ignore If-Modified-Since if the request
+# contains an If-None-Match header field".
+#
+# No second HTTP server is installed on this machine, so there is no other
+# implementation to diff these answers against. The README says so rather
+# than pretending otherwise.
+# ---------------------------------------------------------------------------
+fetch /ok.txt
+ET=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+case "$ET" in
+'"'*'"') ok 'etag: 200 carries a quoted strong ETag' ;;
+*)       bad 'etag: 200 carries a quoted strong ETag' "ETag is [$ET]" ;;
+esac
+
+# A constant ETag satisfies almost every assertion below, so one of them has
+# to be that two different files do not share a tag.
+fetch /sub/deep.txt
+ET_DEEP=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+if [ -n "$ET" ] && [ "$ET" != "$ET_DEEP" ]; then
+	ok 'etag: two files have two tags'
+else
+	bad 'etag: two files have two tags' "both are [$ET]"
+fi
+
+# curl does the whole dance: it parses the tag out of the 200 and builds the
+# conditional request itself.
+rm -f "$TD/et"
+curl --http1.1 -sS --max-time "$MT" --etag-save "$TD/et" -o /dev/null \
+     "$U/ok.txt" 2>"$TD/curlerr"
+SAVED=$(tr -d '\r\n' < "$TD/et" 2>/dev/null)
+if [ -z "$SAVED" ]; then
+	skipt 'etag: curl --etag-save read the tag' \
+	      "this curl saved nothing: $(cat "$TD/curlerr")"
+	skipt 'etag: curl --etag-compare gets 304' 'no saved tag to compare'
+elif [ "$SAVED" = "$ET" ]; then
+	ok 'etag: curl --etag-save read the tag'
+	tstatus 'etag: curl --etag-compare gets 304' 304 /ok.txt \
+	        --etag-compare "$TD/et"
+else
+	bad 'etag: curl --etag-save read the tag' \
+	    "curl saved [$SAVED], the header said [$ET]"
+	tstatus 'etag: curl --etag-compare gets 304' 304 /ok.txt \
+	        --etag-compare "$TD/et"
+fi
+
+# Both directions, because a comparison that never matches tests only the
+# miss path and a comparison that always matches tests only the hit path.
+tstatus 'etag: the matching tag is 304'  304 /ok.txt -H "If-None-Match: $ET"
+tstatus 'etag: a wrong tag is 200'       200 /ok.txt \
+        -H 'If-None-Match: "not-this-one"'
+tbody   'etag: a wrong tag sends the body' 'plain text ok' /ok.txt \
+        -H 'If-None-Match: "not-this-one"'
+tstatus 'etag: HEAD gets 304 too'        304 /ok.txt -I -H "If-None-Match: $ET"
+
+# RFC 9110 13.1.2: "*" matches whenever a current representation exists.
+tstatus 'etag: If-None-Match * is 304'   304 /ok.txt -H 'If-None-Match: *'
+tstatus 'etag: * on a dir index is 304'  304 /     -H 'If-None-Match: *'
+# ...and when none exists the condition is false, so the request proceeds
+# and gets the answer it would have got anyway. Not 304.
+tstatus 'etag: * on a missing file is 404' 404 /nope.txt -H 'If-None-Match: *'
+
+# The weak comparison function, which 13.1.2 requires for If-None-Match and
+# not for If-Match or If-Range: W/"x" and "x" are the same tag here.
+tstatus 'etag: the weak form of the tag is 304' 304 /ok.txt \
+        -H "If-None-Match: W/$ET"
+tstatus 'etag: a list containing the tag is 304' 304 /ok.txt \
+        -H "If-None-Match: \"a\", W/\"b\", $ET"
+tstatus 'etag: a list without it is 200'         200 /ok.txt \
+        -H 'If-None-Match: "a", W/"b", "c"'
+# Nothing in 13.1.2 makes a malformed If-None-Match an error, and refusing
+# one would be this program's usual reflex and wrong here, the same way it
+# is wrong for If-Modified-Since.
+tstatus 'etag: an unparseable tag list is 200' 200 /ok.txt \
+        -H 'If-None-Match: not a tag at all'
+traw 'empty If-None-Match ignored' 200 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match:\r\n\r\n"
+
+# RFC 9110 13.1.3: If-None-Match present means If-Modified-Since is IGNORED,
+# not combined. These two assertions are the ones that separate that from
+# "evaluate both and take either", and the first is the one that matters:
+# the wrong version answers 304 to a client whose cached copy is stale.
+tstatus 'etag: a stale tag beats a satisfied date' 200 /ok.txt \
+        -H 'If-None-Match: "stale"' -H "If-Modified-Since: $LM"
+tstatus 'etag: a matching tag beats an old date'   304 /ok.txt \
+        -H "If-None-Match: $ET" \
+        -H 'If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT'
+
+# RFC 9110 13.2.2 evaluates the precondition before Range.
+tstatus 'etag: 304 beats 206' 304 /ok.txt -H "If-None-Match: $ET" \
+        -H 'Range: bytes=0-1'
+# ...and a 206 that is actually sent carries the same validator as the 200,
+# because it is the same representation.
+fetch /ok.txt -H 'Range: bytes=0-3'
+ET_206=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+if [ -n "$ET" ] && [ "$ET_206" = "$ET" ]; then
+	ok 'etag: the 206 carries the same tag'
+else
+	bad 'etag: the 206 carries the same tag' "206 says [$ET_206], 200 said [$ET]"
+fi
+
+# A 304 carries no body and repeats the validator. Both halves: a 304 with a
+# body is a protocol violation real clients mishandle, and a 304 with no
+# ETag leaves a client that revalidated by tag nothing it can store
+# (RFC 9110 15.4.5). The status line is checked first, because a negative
+# grep over a response that never arrived passes for the wrong reason.
+raw "GET /ok.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: $ET\r\n\r\n"
+_n=$(python3 -c 'import sys
+d = open(sys.argv[1], "rb").read()
+i = d.find(b"\r\n\r\n")
+print(len(d) - i - 4 if i >= 0 else -1)' "$TD/raw")
+if ! grep -qi '^HTTP/1\.[01] 304' "$TD/raw"; then
+	bad 'etag: the 304 has no body' "no 304 status line at all" \
+	    "$(head -c 200 "$TD/raw")"
+	bad 'etag: the 304 repeats the ETag' "no 304 status line at all"
+	bad 'etag: the 304 has no Content-Length' "no 304 status line at all"
+else
+	if [ "$_n" = 0 ]; then ok 'etag: the 304 has no body'
+	else bad 'etag: the 304 has no body' "got $_n bytes after the headers"; fi
+	if grep -qF "ETag: $ET" "$TD/raw"; then
+		ok 'etag: the 304 repeats the ETag'
+	else
+		bad 'etag: the 304 repeats the ETag' "want [$ET]" \
+		    "$(head -c 300 "$TD/raw")"
+	fi
+	if grep -qi '^Content-Length:' "$TD/raw"; then
+		bad 'etag: the 304 has no Content-Length' "$(head -c 300 "$TD/raw")"
+	else
+		ok 'etag: the 304 has no Content-Length'
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# the hole If-Modified-Since cannot see
+#
+# Two generations of one file: same size, same mtime SECOND, different
+# nanoseconds. That is what an editor saving twice or a build system
+# rewriting an asset produces routinely. The timestamps are set by python so
+# the assertion does not depend on winning a race against the wall clock,
+# which is the kind of test that passes on a fast machine and fails in CI.
+# ---------------------------------------------------------------------------
+python3 - "$R/twice.txt" <<'PYTWICE'
+import os, sys
+open(sys.argv[1], "w").write("AAAA\n")
+os.utime(sys.argv[1], ns=(1700000000111111111, 1700000000111111111))
+PYTWICE
+fetch /twice.txt
+T_LM=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+T_ET=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+python3 - "$R/twice.txt" <<'PYTWICE'
+import os, sys
+open(sys.argv[1], "w").write("BBBB\n")
+os.utime(sys.argv[1], ns=(1700000000222222222, 1700000000222222222))
+PYTWICE
+
+# This one passes BECAUSE If-Modified-Since cannot do better, and it is here
+# so that the line after it means something. The bytes on disk have changed
+# and the date-based conditional says they have not.
+tstatus 'etag: by date, a same-second rewrite looks unchanged' 304 \
+        /twice.txt -H "If-Modified-Since: $T_LM"
+tstatus 'etag: by tag, the same rewrite is a 200' 200 \
+        /twice.txt -H "If-None-Match: $T_ET"
+tbody   'etag: and the new bytes are what arrive' 'BBBB' \
+        /twice.txt -H "If-None-Match: $T_ET"
+fetch /twice.txt
+T_ET2=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+T_LM2=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+if [ -n "$T_ET" ] && [ "$T_ET" != "$T_ET2" ]; then
+	ok 'etag: the tag changed with the nanoseconds'
+else
+	bad 'etag: the tag changed with the nanoseconds' "both are [$T_ET]"
+fi
+# ...while Last-Modified did not move at all, which is the whole point.
+if [ -n "$T_LM" ] && [ "$T_LM" = "$T_LM2" ]; then
+	ok 'etag: Last-Modified did not move'
+else
+	bad 'etag: Last-Modified did not move' "was [$T_LM], now [$T_LM2]"
+fi
+
+# ---------------------------------------------------------------------------
 # 10. byte ranges
 #
 # The oracle is the file on disk cut with tail(1) and head(1) -- two

@@ -26,6 +26,13 @@ On the wire:
 - `Last-Modified` on every 200 and 206, in IMF-fixdate. `If-Modified-Since`
   in any of RFC 9110 5.6.7's three formats turns into 304 when the mtime is
   not newer. An unparseable value is ignored, not refused.
+- A strong `ETag` on every 200 and 206, built from `st_dev`, `st_ino`,
+  `st_size` and `st_mtim` to the nanosecond, and `If-None-Match` in all
+  three forms: `*`, one tag, a comma list. The comparison is the weak one
+  RFC 9110 13.1.2 requires, so `W/"x"` matches `"x"`. When `If-None-Match`
+  is present `If-Modified-Since` is ignored entirely, per 13.1.3, and an
+  unparseable list is ignored rather than refused. A 304 repeats the `ETag`
+  and carries no body and no `Content-Length`.
 - `Accept-Ranges: bytes`, and single byte ranges in all three forms:
   `bytes=a-b`, `bytes=a-`, `bytes=-n`: answered 206 with `Content-Range`.
   Unsatisfiable is 416 with `Content-Range: bytes */size`. Malformed is
@@ -107,12 +114,13 @@ Ranked by how little of each is ours.
    to mark that the request is ours even though the verdict is httpd's.
 
 5. Mutation testing, by hand, recorded in README.md. Not an oracle for the
-   program but for the suite. Six mutants so far: deleting the `realpath`
+   program but for the suite. Fourteen mutants so far: deleting the `realpath`
    containment check, deleting it together with the `..` refusal, deleting the
    `..` refusal alone (survives, and the README says why), skewing the `pread`
-   offset by one, reverting the request deadline to a plain idle timeout, and
-   planting a stack overread for `make test-asan`. Each one was built and run
-   through the whole suite and the verdict written down.
+   offset by one, reverting the request deadline to a plain idle timeout,
+   planting a stack overread for `make test-asan`, and eight against
+   `If-None-Match` and the ETag. Each one was built and run through the whole
+   suite and the verdict written down.
 
 ## Non-goals
 
@@ -124,7 +132,8 @@ Ranked by how little of each is ours.
 - Directory listings. 403. A generated listing is a disclosure feature,
   and the one thing a static server should never invent.
 - Being nginx. No config file, no modules, no `Cache-Control`, no
-  compression, no ETags, no access log, no IPv6, no `sendfile(2)`.
+  compression, no access log, no IPv6, no `sendfile(2)`. There is an `ETag`,
+  because an entity-tag is a correctness fix and not a tuning knob.
 - A second parsing path. No fallback parser, no lenient mode, no
   `--allow-bare-lf`. Two parsers for one grammar is how smuggling happens
   inside a single program.
@@ -223,13 +232,30 @@ existed at that point.
 
 ### Milestone 1: close the gaps that cost nothing conceptually
 
-- [ ] `If-None-Match` and a strong ETag built from `st_dev`, `st_ino`,
+- [x] `If-None-Match` and a strong ETag built from `st_dev`, `st_ino`,
       `st_size` and `st_mtim` including nanoseconds.
       why: `If-Modified-Since` has one second of resolution, so a file
       rewritten twice in the same second is served stale to every client that
       asks conditionally. That is a correctness hole the suite can demonstrate
       today and cannot fix, and the oracle is immediate: curl's `--etag-save`
       and `--etag-compare` do the whole protocol dance from the other side.
+      done: 28 assertions, 230 -> 258. The hole is now demonstrated and then
+            closed in four consecutive assertions: one file written twice with
+            python setting both mtimes to the same second and different
+            nanoseconds, where the date-based conditional answers 304 with
+            the old bytes still cached and the tag-based one answers 200 with
+            the new bytes, and `Last-Modified` is asserted not to have moved.
+            curl does the protocol dance itself in two of them, parsing the
+            tag out of the 200 with `--etag-save` and building the request
+            with `--etag-compare`.
+            RFC 9110 13.1.3 was the rule most likely to be got wrong and has
+            its own pair: `If-None-Match` present means `If-Modified-Since` is
+            IGNORED, not combined, so a stale tag with a satisfied date is a
+            200. "Evaluate both and take either" is the natural wrong version
+            and it survives every other assertion in the section.
+            Eight mutants, all caught. No second HTTP server is installed on
+            this machine, so curl and the RFC are the whole oracle for this
+            one and the README says so.
 - [ ] `If-Range`, so a resumed download of a file that changed restarts
       instead of splicing two generations together.
       why: this is a data-corruption bug in the one feature people use

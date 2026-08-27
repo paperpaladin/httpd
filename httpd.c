@@ -62,6 +62,7 @@ struct req {
 	char *head;           /* first header line, or NULL */
 	long long clen;       /* Content-Length, or -1 if absent */
 	const char *ims;      /* If-Modified-Since, unparsed */
+	const char *inm;      /* If-None-Match, unparsed */
 	const char *range;    /* Range, unparsed */
 	int   te_chunked;     /* Transfer-Encoding: chunked */
 	int   te_seen;
@@ -303,6 +304,8 @@ static int parse_headers(char *p, struct req *r)
 			r->range = v;
 		} else if (name_is(line, "if-modified-since")) {
 			r->ims = v;
+		} else if (name_is(line, "if-none-match")) {
+			r->inm = v;
 		} else if (name_is(line, "connection")) {
 			if (strcasestr(v, "close")) r->want_close = 1;
 			if (strcasestr(v, "keep-alive")) r->want_keep = 1;
@@ -477,6 +480,77 @@ static int parse_http_date(const char *s, time_t *out)
 	return -1;
 }
 
+/* ---- entity tags (RFC 9110 8.8.3 and 13.1.2) ----------------------------- */
+/*
+ * A strong validator, built from the four things that change when the bytes
+ * change: the device and inode identify the file, the size and the mtime say
+ * which generation of it this is. The nanoseconds are the whole point of
+ * this header existing here. Last-Modified carries one second of resolution,
+ * so a file rewritten twice within one second is served stale to every
+ * client that asks conditionally, and there is nothing If-Modified-Since can
+ * do about it. st_mtim.tv_nsec can.
+ *
+ * Strong, not weak: these bytes are byte-for-byte the representation, so the
+ * tag may be used for range requests too. It is quoted here, once, so that
+ * every comparison downstream is against the quoted form the wire carries.
+ *
+ * shortcut: the tag is metadata, not content. Two different files with the
+ * same inode generation cannot exist, but a file restored from a backup onto
+ * a different filesystem gets a different tag for identical bytes, and a
+ * cache in front of two servers with different inode numbers will never see
+ * a hit. The upgrade path is hashing the content, which costs a read of the
+ * whole file on every request.
+ */
+static void etag_hdr(char *buf, size_t n, const struct stat *st)
+{
+	snprintf(buf, n, "\"%llx-%llx-%llx-%llx.%08lx\"",
+	         (unsigned long long)st->st_dev,
+	         (unsigned long long)st->st_ino,
+	         (unsigned long long)st->st_size,
+	         (unsigned long long)st->st_mtim.tv_sec,
+	         (unsigned long)st->st_mtim.tv_nsec);
+}
+
+/*
+ * If-None-Match, RFC 9110 13.1.2. The field is either "*", which matches
+ * whenever a representation exists at all, or a comma-separated list of
+ * entity-tags. Returns 1 if any of them matches `etag`.
+ *
+ * The comparison is the WEAK one, which 13.1.2 requires for If-None-Match
+ * specifically: W/"x" and "x" are the same tag here, even though they are
+ * not for If-Match or If-Range. So the W/ prefix is stripped from the
+ * candidate before the opaque-tag bytes are compared. The tags this server
+ * generates are always strong, so the only way a W/ arrives is from a cache
+ * that weakened it, and refusing to match it would turn every one of that
+ * cache's revalidations into a full transfer.
+ *
+ * Anything that is not an entity-tag ends the walk with no match, which is
+ * the conservative answer: the response is then the ordinary 200.
+ */
+static int inm_match(const char *list, const char *etag)
+{
+	const char *p = list;
+	size_t tlen = strlen(etag);
+
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p == '*') return 1;
+
+	for (;;) {
+		const char *q;
+		size_t len;
+
+		while (*p == ' ' || *p == '\t' || *p == ',') p++;
+		if (!*p) return 0;
+		if (p[0] == 'W' && p[1] == '/') p += 2;
+		if (*p != '"') return 0;
+		q = strchr(p + 1, '"');
+		if (!q) return 0;
+		len = (size_t)(q - p) + 1;
+		if (len == tlen && memcmp(p, etag, len) == 0) return 1;
+		p = q + 1;
+	}
+}
+
 /* ---- byte ranges (RFC 9110 14) ------------------------------------------- */
 /*
  * Returns 0 to ignore the header and send the whole thing, 1 having set
@@ -612,11 +686,11 @@ static void refill(struct conn *c)
 
 static void serve(struct conn *c, struct req *r, const char *path)
 {
-	char date[64], lmod[64], idx[PATH_MAX];
+	char date[64], lmod[64], etag[96], idx[PATH_MAX];
 	const char *served = path;
 	struct stat st;
 	off_t first, last;
-	int fd, partial = 0;
+	int fd, partial = 0, notmod;
 
 	/* O_NOFOLLOW is a second, independent refusal for the final
 	 * component: even if realpath(3) were wrong, a symlink here is
@@ -674,29 +748,48 @@ static void serve(struct conn *c, struct req *r, const char *path)
 
 	date_hdr(date, sizeof date, time(NULL));
 	date_hdr(lmod, sizeof lmod, st.st_mtime);
+	etag_hdr(etag, sizeof etag, &st);
 
-	/* Conditional GET. RFC 9110 13.1.3: 304 when the representation has
-	 * not been modified since the date given. Comparison is at
-	 * one-second resolution because that is all an HTTP-date carries, so
-	 * `mtime <= ims` and not `<`. */
-	if (r->ims) {
+	/* Conditional GET, in the order RFC 9110 13.2.2 fixes: If-None-Match
+	 * first, and only If-Modified-Since when there is no If-None-Match.
+	 * 13.1.3 is explicit that If-Modified-Since MUST be ignored when
+	 * If-None-Match is present -- not combined with it. Evaluating both
+	 * and taking either as sufficient is the obvious wrong version, and
+	 * it is wrong in the direction that serves stale bytes: the client
+	 * sending both is saying "here is the tag, and here is the date in
+	 * case you have no tags", and the tag is the better answer.
+	 *
+	 * For If-Modified-Since the comparison is at one-second resolution,
+	 * because that is all an HTTP-date carries, so `mtime <= ims` and
+	 * not `<`.
+	 */
+	notmod = 0;
+	if (r->inm) {
+		notmod = inm_match(r->inm, etag);
+	} else if (r->ims) {
 		time_t ims;
 
-		if (parse_http_date(r->ims, &ims) == 0 && st.st_mtime <= ims) {
-			close(fd);
-			c->outlen = c->outoff = 0;
-			out_add(c, "HTTP/1.1 304 Not Modified\r\n");
-			out_add(c, "Date: %s\r\n", date);
-			out_add(c, "Last-Modified: %s\r\n", lmod);
-			/* No Content-Length and no body: a 304 that claims a
-			 * length desynchronises a keep-alive connection. */
-			out_add(c, "Connection: %s\r\n\r\n",
-			        c->keep ? "keep-alive" : "close");
-			c->filefd = -1;
-			c->closing = !c->keep;
-			c->state = S_WRITE;
-			return;
-		}
+		notmod = parse_http_date(r->ims, &ims) == 0
+		         && st.st_mtime <= ims;
+	}
+	if (notmod) {
+		close(fd);
+		c->outlen = c->outoff = 0;
+		out_add(c, "HTTP/1.1 304 Not Modified\r\n");
+		out_add(c, "Date: %s\r\n", date);
+		out_add(c, "Last-Modified: %s\r\n", lmod);
+		/* RFC 9110 15.4.5: a 304 carries the same validators a 200
+		 * would have carried. A 304 with no ETag tells a client that
+		 * revalidated by tag nothing it can store. */
+		out_add(c, "ETag: %s\r\n", etag);
+		/* No Content-Length and no body: a 304 that claims a
+		 * length desynchronises a keep-alive connection. */
+		out_add(c, "Connection: %s\r\n\r\n",
+		        c->keep ? "keep-alive" : "close");
+		c->filefd = -1;
+		c->closing = !c->keep;
+		c->state = S_WRITE;
+		return;
 	}
 
 	first = 0;
@@ -722,6 +815,7 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	        partial ? "206 Partial Content" : "200 OK");
 	out_add(c, "Date: %s\r\n", date);
 	out_add(c, "Last-Modified: %s\r\n", lmod);
+	out_add(c, "ETag: %s\r\n", etag);
 	out_add(c, "Content-Type: %s\r\n", ctype(served));
 	out_add(c, "Accept-Ranges: bytes\r\n");
 	if (partial)

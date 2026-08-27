@@ -152,6 +152,104 @@ touching the filesystem at all and because it makes the refusal independent of
 removed, it has to be one where `realpath` succeeds inside the root: the
 stricter-than-necessary refusal of `/sub/../ok.txt`.
 
+## Conditional requests
+
+Two of them: `If-Modified-Since`, and `If-None-Match` against a strong
+`ETag`. Both 200 and 206 carry `Last-Modified` and `ETag`. A 304 carries
+`Last-Modified` and `ETag`, no body, and no `Content-Length`.
+
+### The tag
+
+```
+ETag: "32-7d2b11-6-6ad47b32.056711f4"
+        dev  ino    sz  mtime s  mtime ns
+```
+
+`st_dev` and `st_ino` say which file; `st_size` and `st_mtim` say which
+generation of it. The nanoseconds are the entire reason this header is
+here. An HTTP-date carries one second, so `If-Modified-Since` cannot tell
+two versions of a file written inside the same second apart, and an editor
+saving twice or a build system rewriting an asset does that routinely.
+
+The suite demonstrates the hole and then closes it, in four consecutive
+assertions: one file, two contents of the same length, both mtimes set by
+python to the same second and different nanoseconds, so the case does not
+depend on winning a race against the wall clock.
+`etag: by date, a same-second rewrite looks unchanged` asserts the 304,
+because a 304 is the best a date-based conditional can do and the next
+assertion means nothing without it. `etag: by tag, the same rewrite is a
+200` and `etag: and the new bytes are what arrive` are the fix.
+
+### The rules, and the one that is easiest to get backwards
+
+RFC 9110 13.1.2 for the matching, 13.1.3 for the precedence, 13.2.2 for the
+evaluation order, 15.4.5 for what a 304 must carry.
+
+- `*` matches whenever a representation exists. On a file that does not
+  exist the condition is false and the answer is the ordinary 404, not a
+  304.
+- The comparison is the **weak** one, which 13.1.2 requires for
+  `If-None-Match` and not for `If-Match` or `If-Range`: `W/"x"` matches
+  `"x"`. The tags generated here are always strong, so a `W/` can only have
+  come from a cache that weakened one, and refusing to match it would turn
+  every revalidation that cache makes into a full transfer.
+- A comma list matches if any member does.
+- An unparseable list is ignored and the answer is 200. Same rule as a
+  malformed `If-Modified-Since`, and the opposite of this program's reflex
+  everywhere else.
+- `If-None-Match` present means `If-Modified-Since` is **ignored**, not
+  combined with it. This is the one worth a paragraph. "Evaluate both and
+  take either" is the natural implementation, it passes every other
+  assertion in the section, and it fails in the direction that serves
+  nothing: a client holding a stale tag and a recent date gets a 304 and
+  keeps the stale copy. `etag: a stale tag beats a satisfied date` is the
+  assertion, and the mutant that evaluates both fails it and nothing else.
+- The precondition is evaluated before `Range`, so a matching tag on a
+  range request is a 304 and not a 206.
+
+### The oracle, and what it is missing
+
+curl does the whole protocol dance in two assertions: `--etag-save` parses
+the tag out of the 200 with curl's own parser and `--etag-compare` builds
+the `If-None-Match` request from it, so neither the reading of the header
+nor the writing of the request is ours. The remaining assertions send
+explicit `-H 'If-None-Match: ...'` values and take curl's reported status.
+
+**No second HTTP server is installed on this machine.** Unlike
+`Content-Type`, where `file(1)` answers the same question from the content,
+there is no other implementation here to diff these answers against: the
+only authorities for this feature are curl and the RFC text. That is a
+weaker position than the rest of the suite is in, and it is written down
+rather than papered over. `wget` is installed and is a second client, but it
+has no `If-None-Match` support at all, so it cannot stand in.
+
+### Mutation testing of the conditionals
+
+Eight mutants, each built and run through the whole suite. No survivors.
+
+| Mutation | Verdict |
+| --- | --- |
+| compare the tag with `!=` instead of `==` | **caught**: 12 failures |
+| emit a body and a `Content-Length` with the 304 | **caught**: 5, including `keep: 304 does not close` |
+| drop the `ETag` from the 304 | **caught**: 1, `etag: the 304 repeats the ETag` |
+| evaluate both conditionals and take either | **caught**: 1, `etag: a stale tag beats a satisfied date` |
+| strong comparison: do not strip the `W/` | **caught**: 2 |
+| drop the nanoseconds from the tag | **caught**: 3, all in the same-second block |
+| ignore the `*` form | **caught**: 2 |
+| drop the `ETag` from the 200 | **caught**: 13 failures and 2 skips |
+
+Two rows are worth reading twice. The 304-with-a-body mutant was expected to
+fail the two assertions that count the bytes after the header block; it also
+failed `keep: 304 does not close`, which is curl noticing that the
+connection had desynchronised and opening a second one. That is the
+real-world consequence of the violation, caught by an assertion written
+years of commits earlier for something else.
+
+And the last row's two skips are the loud-skip path working as intended:
+with no `ETag` in the 200, `curl --etag-save` writes an empty file, and the
+suite says it could not make the assertion instead of passing it.
+
+
 ## The oracle
 
 `curl` is the authority. Every assertion drives a real `curl` against a real
@@ -197,8 +295,11 @@ Not implemented at all
   completely. Two names pointing here serve the same tree.
 - Directory listings. A directory with no `index.html` is 403. A generated
   listing is a disclosure feature.
-- ETags and `If-None-Match`, `If-Range`, `If-Unmodified-Since`,
-  `If-Match`. `If-Modified-Since` is the only conditional.
+- `If-Range`, `If-Unmodified-Since` and `If-Match`. `If-Modified-Since`
+  and `If-None-Match` are the only two conditionals. The missing `If-Range`
+  is the one that costs something: a `curl -C -` resume of a file that
+  changed between attempts splices two generations together and nothing
+  stops it.
 - Compression. No `Content-Encoding`, no precompressed `.gz` lookup.
   `Accept-Encoding` is ignored.
 - `Content-Type` charset. Never sent. A guessed charset is a claim about
@@ -224,6 +325,13 @@ source naming its upgrade path)
   permit ignoring the `Range` header and answering 200; 416 is the louder
   answer and it is a deliberate deviation.
 - The MIME table is hard-coded, fifteen extensions. Not `/etc/mime.types`.
+- The `ETag` is built from the inode, not from the bytes. It is a correct
+  strong validator for one copy of one file on one filesystem, and it says
+  nothing useful across machines: two servers behind one cache give the same
+  file two different tags and the cache never gets a hit, and a file
+  restored from a backup gets a new tag for identical content. The upgrade
+  path is hashing the content, which costs a read of the whole file on every
+  request.
 - `realpath(3)` is a check on a path, so there is a TOCTOU window between
   it and `open(2)` in which a path component could be replaced by a symlink.
   Closing it means walking the path with `openat(2)` and `O_NOFOLLOW` one
