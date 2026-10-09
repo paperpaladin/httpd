@@ -29,7 +29,7 @@
 #define MAXTARGET 2048
 #define MAXBODY   (1 << 20)   /* a GET body this server will read and discard */
 
-enum state { S_HEAD, S_BODY, S_WRITE, S_DONE };
+enum state { S_HEAD, S_BODY, S_WRITE, S_LINGER, S_DONE };
 
 /* Where the chunked-body drainer is in RFC 9112 7.1's grammar. */
 enum chunk_state { CH_SIZE, CH_DATA, CH_CRLF, CH_TRAILER };
@@ -968,6 +968,24 @@ static void on_readable(int i)
 	struct conn *c = &conns[i];
 	ssize_t n;
 
+	if (c->state == S_LINGER) {
+		char junk[4096];
+
+		n = read(c->fd, junk, sizeof junk);
+		if (n > 0) {
+			c->last = time(NULL);
+			c->body_total += n;
+			if (c->body_total > MAXBODY)
+				c->state = S_DONE;
+			return;
+		}
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+		              errno == EINTR))
+			return;
+		c->state = S_DONE;
+		return;
+	}
+
 	n = read(c->fd, c->in + c->inlen, INBUF - 1 - c->inlen);
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -1034,7 +1052,22 @@ static void on_writable(int i)
 		c->filefd = -1;
 	}
 	if (c->closing) {
-		c->state = S_DONE;
+		/*
+		 * Lingering close. close(2) on a socket that still has
+		 * unread data in its receive queue makes the kernel send
+		 * RST, and an RST discards whatever of our response has not
+		 * yet been read -- so the client of a refused 2MB upload saw
+		 * "connection reset by peer" instead of the 413 that was
+		 * sent to it. Shut down the write side, keep reading and
+		 * discarding until the peer is finished, then close.
+		 *
+		 * Bounded two ways: the idle timeout applies, and
+		 * body_total counts the bytes being thrown away.
+		 */
+		shutdown(c->fd, SHUT_WR);
+		c->body_total = 0;
+		c->last = time(NULL);
+		c->state = S_LINGER;
 		return;
 	}
 
@@ -1195,7 +1228,7 @@ int main(int argc, char **argv)
 		for (i = nconn - 1; i >= 0; i--) {
 			struct conn *c = &conns[i];
 
-			if (c->state == S_WRITE) {
+			if (c->state == S_WRITE || c->state == S_LINGER) {
 				if (now - c->last > idle_timeout)
 					conn_close(i);
 			} else if (now - c->rstart > idle_timeout) {

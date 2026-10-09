@@ -137,7 +137,7 @@ Ranked by how little of each is ours.
 
 ## Commit sequence
 
-Seventeen commits, every one of which builds and passes the assertions that
+Eighteen commits, every one of which builds and passes the assertions that
 existed at that point.
 
 - [x] `Makefile`, `LICENSE`, `.gitignore`, and `httpd.c` with the listening
@@ -214,6 +214,12 @@ existed at that point.
 - [x] `PLAN.md`.
       why: the contract, the ranked oracles and the forward order belong in a
       different document from the transcript.
+- [x] Lingering close.
+      why: two intermittent failures in a clean run, and the first was a real
+      defect being reported as flakiness. `close(2)` on a socket with unread
+      data makes the kernel send RST, which discards the response -- so every
+      refused upload reached its client as "connection reset" rather than as
+      the status code explaining why.
 
 ### Milestone 1 -- close the gaps that cost nothing conceptually
 
