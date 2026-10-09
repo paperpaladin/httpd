@@ -485,6 +485,56 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 8. HEAD
+#
+# RFC 9110 9.3.2: identical to the GET response, minus the body. The
+# assertion that matters is not "the body is empty" but "the headers are the
+# same ones", which is checked by diffing the two header blocks with Date
+# removed -- Date legitimately differs by a second.
+# ---------------------------------------------------------------------------
+tstatus 'head: 200'              200 /ok.txt -I
+tstatus 'head: 404 for missing'  404 /nope   -I
+tstatus 'head: 403 for dotfile'  403 /.hidden -I
+
+fetch /ok.txt -I
+cp "$TD/h" "$TD/head-h"
+
+# curl -I writes the header block to -o as well, so "the body is empty"
+# cannot be asserted by measuring curl's output file -- it was 121 bytes of
+# headers and the assertion was measuring the wrong thing. Count the bytes
+# after the terminator on the wire instead.
+raw "HEAD /ok.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+_n=$(python3 -c 'import sys
+d = open(sys.argv[1], "rb").read()
+i = d.find(b"\r\n\r\n")
+print(len(d) - i - 4 if i >= 0 else -1)' "$TD/raw")
+if [ "$_n" = 0 ]; then ok 'head: not one body byte on the wire'
+else bad 'head: not one body byte on the wire' "got $_n bytes after the headers"; fi
+if grep -q '^Content-Length: 14' "$TD/raw"; then
+	ok 'head: Content-Length still sent'
+else
+	bad 'head: Content-Length still sent' "$(head -c 200 "$TD/raw")"
+fi
+
+fetch /ok.txt
+cp "$TD/h" "$TD/get-h"
+grep -vi '^Date:' "$TD/head-h" >"$TD/head-h2"
+grep -vi '^Date:' "$TD/get-h"  >"$TD/get-h2"
+if diff -u "$TD/head-h2" "$TD/get-h2" >"$TD/hdiff" 2>&1; then
+	ok 'head: headers identical to GET'
+else
+	bad 'head: headers identical to GET' "$(cat "$TD/hdiff")"
+fi
+
+# The big one too: Content-Length must be the file size, not zero.
+fetch /big.bin -I
+if grep -q "^Content-Length: $BIGSZ" "$TD/h"; then
+	ok 'head: Content-Length is the real size'
+else
+	bad 'head: Content-Length is the real size' "$(cat "$TD/h")"
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'

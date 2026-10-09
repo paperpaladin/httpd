@@ -541,10 +541,20 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	out_add(c, "Content-Length: %lld\r\n", (long long)st.st_size);
 	out_add(c, "Connection: close\r\n\r\n");
 
-	(void)r;
 	c->filefd = fd;
 	c->fileoff = 0;
 	c->fileend = st.st_size;
+
+	/* HEAD. RFC 9110 9.3.2: the response is identical to the GET
+	 * response except that there is no body. Identical means the
+	 * Content-Length is still the length the GET would have sent -- it
+	 * is NOT zero, and it is not omitted. Everything above this line is
+	 * the same code for both methods precisely so the two cannot drift. */
+	if (strcmp(r->method, "HEAD") == 0) {
+		close(fd);
+		c->filefd = -1;
+		c->fileend = 0;
+	}
 	c->closing = 1;
 	c->state = S_WRITE;
 }
