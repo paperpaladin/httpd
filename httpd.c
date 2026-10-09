@@ -9,6 +9,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -17,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,6 +38,8 @@ struct conn {
 	char  out[OUTBUF];
 	size_t outlen, outoff;
 	int   closing;        /* send this response, then hang up */
+	int   filefd;         /* body source, or -1 */
+	off_t fileoff, fileend;
 	time_t last;          /* for the idle timeout */
 };
 
@@ -56,12 +61,18 @@ static struct conn conns[MAXCONN];
 static int nconn;
 static int idle_timeout = 10;   /* seconds; -t changes it */
 
+/* The document root, as realpath(3) sees it: absolute, no symlinks left in
+ * it, no trailing slash. Every served path must be inside this string. */
+static char docroot[PATH_MAX];
+static size_t docroot_len;
+
 static void die(const char *m) { perror(m); exit(1); }
 
 /* ---- connection bookkeeping ---------------------------------------------- */
 
 static void conn_close(int i)
 {
+	if (conns[i].filefd >= 0) close(conns[i].filefd);
 	close(conns[i].fd);
 	conns[i] = conns[--nconn];
 }
@@ -281,18 +292,240 @@ static int parse_headers(char *p, struct req *r)
 	return 0;
 }
 
+/* ---- the path resolver --------------------------------------------------- */
+/*
+ * This is the security property of the whole program. A static file server is
+ * a path traversal sink: the request target is attacker-controlled and ends up
+ * in open(2). Everything below exists to make one statement true --
+ *
+ *   no request can cause a byte to be read from outside the document root --
+ *
+ * and it is stated three times over, because each layer alone has a known
+ * hole:
+ *
+ *   1. Percent-decoding happens exactly once. "%2e%2e%2f" becomes "../" and
+ *      is then caught by layer 2; "%252e%252e%252f" becomes the literal
+ *      seven-character segment "%2e%2e%2f", which is a filename, not a
+ *      traversal. Decoding in a loop until nothing changes is the bug that
+ *      makes double encoding work.
+ *   2. A ".." segment is refused outright rather than popped. Popping is what
+ *      a normaliser does, and a normaliser has to be correct about every
+ *      encoding of every separator to be safe. Refusing needs to be correct
+ *      about one string.
+ *   3. realpath(3) resolves the result and the answer must still begin with
+ *      the document root. This is the layer that catches a symlink, which the
+ *      first two cannot see at all: nothing in "/link/secret" looks hostile.
+ *
+ * shortcut: layer 3 is a check on the path, so there is a TOCTOU window
+ * between realpath(3) and open(2) in which a component could be replaced by a
+ * symlink. Closing it means walking the path with openat(2) and O_NOFOLLOW
+ * one segment at a time and keeping the directory fd; that is the upgrade
+ * path. It needs a local attacker with write access inside the document root,
+ * who can already replace the file being served.
+ */
+
+static int hexval(int ch)
+{
+	if (ch >= '0' && ch <= '9') return ch - '0';
+	if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+	return -1;
+}
+
+/* Returns 0 and fills `out`, or the status code to refuse with. */
+static int resolve(const char *target, char *out, size_t outsz)
+{
+	char dec[MAXTARGET + 1], joined[PATH_MAX], real[PATH_MAX];
+	const char *p = target;
+	char *seg, *save;
+	size_t n = 0, jlen;
+	int jn;
+
+	/* absolute-form. RFC 9112 3.2.2: "a server MUST accept the
+	 * absolute-form in requests". Skip scheme and authority, keep the
+	 * path; a target of "http://host" with no path means "/". */
+	if (strncasecmp(p, "http://", 7) == 0) {
+		const char *slash = strchr(p + 7, '/');
+		p = slash ? slash : "/";
+	}
+
+	/* Everything else must be origin-form. asterisk-form is only for
+	 * OPTIONS, authority-form only for CONNECT, and a target that does
+	 * not start with "/" is a relative path -- which is exactly how a
+	 * traversal is written when the leading slash is in the way. */
+	if (*p != '/') return 400;
+
+	/* "//host/path" is a network-path reference: an authority this server
+	 * would silently read as a directory called "host". */
+	if (p[1] == '/') return 400;
+
+	for (; *p && *p != '?' && *p != '#'; p++) {
+		int ch = (unsigned char)*p;
+
+		if (ch == '%') {
+			int hi = hexval((unsigned char)p[1]);
+			int lo = hexval((unsigned char)p[2]);
+
+			if (hi < 0 || lo < 0) return 400;
+			ch = hi * 16 + lo;
+			p += 2;
+		}
+		/* A decoded NUL ends the string for every C interface after
+		 * this point: "/public.html%00.jpg" would be checked as a
+		 * .jpg and opened as "/public.html". Refuse it instead. */
+		if (ch == 0) return 400;
+		if (ch < 0x20 || ch == 0x7f) return 400;
+		if (n + 1 >= sizeof dec) return 414;
+		dec[n++] = (char)ch;
+	}
+	dec[n] = '\0';
+
+	jlen = strlen(docroot);
+	if (jlen >= sizeof joined) return 414;
+	memcpy(joined, docroot, jlen + 1);
+
+	for (seg = strtok_r(dec, "/", &save); seg;
+	     seg = strtok_r(NULL, "/", &save)) {
+		if (strcmp(seg, ".") == 0) continue;
+		if (strcmp(seg, "..") == 0) return 403;
+		/* No dotfiles, ever. ".git", ".env", ".htpasswd" and
+		 * ".ssh" are the reason, and "..." or "..\\.." are caught
+		 * here too rather than by a cleverer ".." test. */
+		if (seg[0] == '.') return 403;
+		jn = snprintf(joined + jlen, sizeof joined - jlen, "/%s", seg);
+		if (jn < 0 || (size_t)jn >= sizeof joined - jlen) return 414;
+		jlen += (size_t)jn;
+	}
+
+	if (!realpath(joined, real))
+		return (errno == ENOENT || errno == ENOTDIR) ? 404 : 403;
+
+	/* The containment check. Layers 1 and 2 are defence in depth; this is
+	 * the property itself, and it is the only one that sees a symlink. */
+	if (strncmp(real, docroot, docroot_len) != 0) return 403;
+	if (real[docroot_len] != '\0' && real[docroot_len] != '/') return 403;
+
+	if (strlen(real) >= outsz) return 414;
+	strcpy(out, real);
+	return 0;
+}
+
+/* ---- serving a file ------------------------------------------------------ */
+
+static void refill(struct conn *c)
+{
+	size_t want;
+	ssize_t n;
+
+	if (c->filefd < 0 || c->fileoff >= c->fileend) return;
+	want = (size_t)(c->fileend - c->fileoff);
+	if (want > OUTBUF) want = OUTBUF;
+	n = pread(c->filefd, c->out, want, c->fileoff);
+	if (n <= 0) {       /* truncated under us; the length is already sent */
+		c->state = S_DONE;
+		return;
+	}
+	c->fileoff += n;
+	c->outlen = (size_t)n;
+	c->outoff = 0;
+}
+
+static void serve(struct conn *c, struct req *r, const char *path)
+{
+	char date[64], idx[PATH_MAX];
+	struct stat st;
+	int fd;
+
+	/* O_NOFOLLOW is a second, independent refusal for the final
+	 * component: even if realpath(3) were wrong, a symlink here is
+	 * ELOOP rather than an open file.
+	 *
+	 * O_NONBLOCK is not optional either, and not for the usual reason:
+	 * open(2) on a FIFO with O_RDONLY blocks until a writer appears. A
+	 * single-process server that does that has been killed by one request
+	 * for one fifo inside the document root -- every later connection is
+	 * accepted by the kernel and never answered. Found by the assertion
+	 * for /fifo, which hung the whole suite.
+	 */
+	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		reply(c, errno == ENOENT || errno == ENOTDIR ? 404 : 403,
+		      errno == ENOENT || errno == ENOTDIR ? "Not Found"
+		                                          : "Forbidden",
+		      NULL, 1);
+		return;
+	}
+
+	/* fstat on the descriptor, not stat on the path: the size that goes
+	 * into Content-Length has to be the size of the file being read. */
+	if (fstat(fd, &st) < 0) {
+		close(fd);
+		reply(c, 403, "Forbidden", NULL, 1);
+		return;
+	}
+
+	/* A directory serves index.html if it is there, and never a listing.
+	 * open(2) with O_RDONLY succeeds on a directory on Linux, so this has
+	 * to be decided from fstat and not from an EISDIR that never comes. */
+	if (S_ISDIR(st.st_mode)) {
+		int jn = snprintf(idx, sizeof idx, "%s/index.html", path);
+
+		close(fd);
+		fd = (jn > 0 && (size_t)jn < sizeof idx)
+		     ? open(idx, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+		     : -1;
+		if (fd < 0 || fstat(fd, &st) < 0) {
+			if (fd >= 0) close(fd);
+			reply(c, 403, "Forbidden", NULL, 1);
+			return;
+		}
+	}
+
+	/* A fifo, a device or a socket inside the root is not a document.
+	 * Serving one would block the whole process on a read. */
+	if (!S_ISREG(st.st_mode)) {
+		close(fd);
+		reply(c, 403, "Forbidden", NULL, 1);
+		return;
+	}
+
+	date_hdr(date, sizeof date, time(NULL));
+	c->outlen = c->outoff = 0;
+	out_add(c, "HTTP/1.1 200 OK\r\n");
+	out_add(c, "Date: %s\r\n", date);
+	out_add(c, "Content-Type: application/octet-stream\r\n");
+	out_add(c, "Content-Length: %lld\r\n", (long long)st.st_size);
+	out_add(c, "Connection: close\r\n\r\n");
+
+	(void)r;
+	c->filefd = fd;
+	c->fileoff = 0;
+	c->fileend = st.st_size;
+	c->closing = 1;
+	c->state = S_WRITE;
+}
+
 /* ---- request handling ---------------------------------------------------- */
 
 static void handle(struct conn *c)
 {
 	char *eoh, *line, *nl;
-	char empty[1] = "";
+	char empty[1] = "", path[PATH_MAX];
 	struct req r;
 	int code;
 
 	memset(&r, 0, sizeof r);
 
 	eoh = memmem(c->in, c->inlen, "\r\n\r\n", 4);
+
+	/* A NUL anywhere in the header section. Everything after this point
+	 * treats the section as C strings, so a NUL would silently truncate a
+	 * target or a field value -- and the bytes behind it would be read by
+	 * the next hop as something else entirely. */
+	if (memchr(c->in, '\0', (size_t)(eoh - c->in))) {
+		reply(c, 400, "Bad Request", NULL, 1);
+		return;
+	}
 	*eoh = '\0';                     /* the header section is now a string */
 	line = c->in;
 	nl = strstr(line, "\r\n");
@@ -322,8 +555,15 @@ static void handle(struct conn *c)
 		return;
 	}
 
-	/* The path resolver and the file server arrive in later commits. */
-	reply(c, 404, "Not Found", NULL, 1);
+	code = resolve(r.target, path, sizeof path);
+	if (code) {
+		reply(c, code, code == 400 ? "Bad Request"
+		            : code == 403 ? "Forbidden"
+		            : code == 414 ? "URI Too Long"
+		                          : "Not Found", NULL, 1);
+		return;
+	}
+	serve(c, &r, path);
 }
 
 /* ---- the state machine --------------------------------------------------- */
@@ -370,8 +610,13 @@ static void on_writable(int i)
 	}
 	c->outoff += (size_t)n;
 	c->last = time(NULL);
-	if (c->outoff == c->outlen)
-		c->state = S_DONE;
+	if (c->outoff < c->outlen)
+		return;
+	if (c->filefd >= 0 && c->fileoff < c->fileend) {
+		refill(c);                  /* more of the body */
+		return;
+	}
+	c->state = S_DONE;
 }
 
 static int listen_on(const char *addr, int port)
@@ -406,22 +651,36 @@ int main(int argc, char **argv)
 {
 	struct pollfd pfd[MAXCONN + 1];
 	const char *addr = "127.0.0.1";
+	const char *root = ".";
 	int port = 0, lfd, opt;
 
 	/* Writing to a peer that has closed must be an errno, not a death. */
 	signal(SIGPIPE, SIG_IGN);
 
-	while ((opt = getopt(argc, argv, "a:p:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "a:p:r:t:")) != -1) {
 		switch (opt) {
 		case 'a': addr = optarg; break;
+		case 'r': root = optarg; break;
 		case 'p': port = atoi(optarg); break;
 		case 't': idle_timeout = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: httpd [-a addr] [-p port] "
-			                "[-t idle_seconds]\n");
+			                "[-r docroot] [-t idle_seconds]\n");
 			return 2;
 		}
 	}
+
+	/* Resolve the root once, at startup, with no symlinks left in it.
+	 * Comparing a request's realpath against an unresolved root would
+	 * fail for every root reached through a symlink -- and /tmp is one
+	 * on plenty of systems. */
+	if (!realpath(root, docroot)) {
+		fprintf(stderr, "httpd: %s: %s\n", root, strerror(errno));
+		return 1;
+	}
+	docroot_len = strlen(docroot);
+	if (docroot_len == 1)       /* root is "/": every path is inside it */
+		docroot_len = 0;
 
 	lfd = listen_on(addr, port);
 
@@ -467,6 +726,7 @@ int main(int argc, char **argv)
 			if (cfd >= 0) {
 				memset(&conns[nconn], 0, sizeof conns[0]);
 				conns[nconn].fd = cfd;
+				conns[nconn].filefd = -1;
 				conns[nconn].state = S_HEAD;
 				conns[nconn].last = time(NULL);
 				nconn++;
