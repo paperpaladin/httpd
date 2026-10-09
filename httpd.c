@@ -1,12 +1,6 @@
 /*
  * httpd -- a single-process HTTP/1.1 static file server, poll(2) only.
  *
- * Stage 1: the listening socket and the poll loop. Every connection is read
- * until the end of the header section and answered with a fixed response.
- * Parsing, path resolution and file serving arrive in later commits; what is
- * being established here is the thing all of them sit on -- a non-blocking
- * accept/read/write state machine that one slow or rude client cannot stall.
- *
  * shortcut: single process, single thread. A fork-per-core model would use
  * the other seven cores; the ceiling is one CPU's worth of throughput, and
  * the upgrade path is SO_REUSEPORT plus fork(), which changes no parsing.
@@ -29,6 +23,7 @@
 #define MAXCONN   256     /* poll(2) slots for clients, plus the listener */
 #define INBUF     8192    /* header section limit; also the read buffer */
 #define OUTBUF    65536
+#define MAXTARGET 2048
 
 enum state { S_HEAD, S_WRITE, S_DONE };
 
@@ -41,6 +36,14 @@ struct conn {
 	size_t outlen, outoff;
 	int   closing;        /* send this response, then hang up */
 	time_t last;          /* for the idle timeout */
+};
+
+/* One parsed request. Points into conn.in, which is NUL-punched in place. */
+struct req {
+	char *method;
+	char *target;
+	int   minor;          /* HTTP/1.minor */
+	char *head;           /* first header line, or NULL */
 };
 
 static struct conn conns[MAXCONN];
@@ -69,19 +72,133 @@ static void out_add(struct conn *c, const char *fmt, ...)
 		c->outlen += (size_t)n;
 }
 
-/* ---- the fixed stage-1 response ------------------------------------------ */
-
-static void respond(struct conn *c)
+static void date_hdr(char *buf, size_t n, time_t t)
 {
-	static const char body[] = "httpd\n";
+	struct tm tm;
 
-	out_add(c, "HTTP/1.1 200 OK\r\n");
+	gmtime_r(&t, &tm);
+	strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+}
+
+/*
+ * Every response that is not a file body goes through here. The body is the
+ * status line in text so that a human driving curl by hand sees what
+ * happened, and `extra` carries the headers a particular status requires
+ * (Allow: for 405, Content-Range: for 416).
+ */
+static void reply(struct conn *c, int code, const char *reason,
+                  const char *extra, int close_now)
+{
+	char body[128], date[64];
+	int blen;
+
+	blen = snprintf(body, sizeof body, "%d %s\n", code, reason);
+	date_hdr(date, sizeof date, time(NULL));
+
+	c->outlen = c->outoff = 0;
+	out_add(c, "HTTP/1.1 %d %s\r\n", code, reason);
+	out_add(c, "Date: %s\r\n", date);
 	out_add(c, "Content-Type: text/plain\r\n");
-	out_add(c, "Content-Length: %zu\r\n", sizeof body - 1);
-	out_add(c, "Connection: close\r\n\r\n");
+	out_add(c, "Content-Length: %d\r\n", blen);
+	if (extra)
+		out_add(c, "%s", extra);
+	out_add(c, "Connection: %s\r\n\r\n", close_now ? "close" : "keep-alive");
 	out_add(c, "%s", body);
-	c->closing = 1;
+
+	c->closing = close_now;
 	c->state = S_WRITE;
+}
+
+/* ---- request line -------------------------------------------------------- */
+
+/* RFC 9110 5.6.2 tchar. Anything else in a method is a malformed request. */
+static int is_tchar(unsigned char ch)
+{
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+	       (ch >= '0' && ch <= '9') ||
+	       !!strchr("!#$%&'*+-.^_`|~", ch);
+}
+
+static int all_tchar(const char *s)
+{
+	if (!*s) return 0;
+	for (; *s; s++)
+		if (!is_tchar((unsigned char)*s)) return 0;
+	return 1;
+}
+
+/*
+ * Split the request line in place. Returns 0 on success, or the status code
+ * to send. RFC 9112 3: exactly one SP between the three fields -- no tabs,
+ * no runs of spaces, no leading whitespace. A server that is generous here
+ * disagrees with the next hop about where the target ends, which is one of
+ * the two classic request smuggling primitives.
+ */
+static int parse_reqline(char *line, struct req *r)
+{
+	char *sp1, *sp2, *v;
+
+	sp1 = strchr(line, ' ');
+	if (!sp1) return 400;
+	*sp1 = '\0';
+	sp2 = strchr(sp1 + 1, ' ');
+	if (!sp2) return 400;            /* HTTP/0.9 style, not supported */
+	*sp2 = '\0';
+
+	r->method = line;
+	r->target = sp1 + 1;
+	v = sp2 + 1;
+
+	if (!all_tchar(r->method)) return 400;
+	if (!*r->target || strchr(r->target, ' ')) return 400;
+	if (strlen(r->target) > MAXTARGET) return 414;
+
+	/* HTTP-version is exactly "HTTP/" DIGIT "." DIGIT. */
+	if (strncmp(v, "HTTP/", 5) != 0) return 400;
+	if (strlen(v) != 8 || v[6] != '.' ||
+	    v[5] < '0' || v[5] > '9' || v[7] < '0' || v[7] > '9')
+		return 400;
+	if (v[5] != '1') return 505;     /* HTTP/2 and HTTP/0.9 over TCP */
+	r->minor = v[7] - '0';
+	if (r->minor > 1) return 505;
+	return 0;
+}
+
+/* ---- request handling ---------------------------------------------------- */
+
+static void handle(struct conn *c)
+{
+	char *eoh, *line, *nl;
+	struct req r;
+	int code;
+
+	memset(&r, 0, sizeof r);
+
+	eoh = memmem(c->in, c->inlen, "\r\n\r\n", 4);
+	*eoh = '\0';                     /* the header section is now a string */
+	line = c->in;
+	nl = strstr(line, "\r\n");
+	if (nl) {
+		*nl = '\0';
+		r.head = nl + 2;
+	}
+
+	code = parse_reqline(line, &r);
+	if (code) {
+		reply(c, code, code == 400 ? "Bad Request"
+		            : code == 414 ? "URI Too Long"
+		                          : "HTTP Version Not Supported",
+		      NULL, 1);
+		return;
+	}
+
+	if (strcmp(r.method, "GET") != 0 && strcmp(r.method, "HEAD") != 0) {
+		reply(c, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n", 1);
+		return;
+	}
+
+	/* The path resolver and the file server arrive in later commits. */
+	reply(c, 404, "Not Found", NULL, 1);
 }
 
 /* ---- the state machine --------------------------------------------------- */
@@ -91,7 +208,7 @@ static void on_readable(int i)
 	struct conn *c = &conns[i];
 	ssize_t n;
 
-	n = read(c->fd, c->in + c->inlen, INBUF - c->inlen);
+	n = read(c->fd, c->in + c->inlen, INBUF - 1 - c->inlen);
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 			return;
@@ -106,9 +223,12 @@ static void on_readable(int i)
 	c->last = time(NULL);
 
 	if (memmem(c->in, c->inlen, "\r\n\r\n", 4))
-		respond(c);
-	else if (c->inlen == INBUF)        /* header section too large */
-		c->state = S_DONE;
+		handle(c);
+	else if (c->inlen == INBUF - 1)
+		/* The whole header section, request line included, has to fit
+		 * in one buffer. 431 rather than silently truncating: a
+		 * truncated header section is a different request. */
+		reply(c, 431, "Request Header Fields Too Large", NULL, 1);
 }
 
 static void on_writable(int i)
