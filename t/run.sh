@@ -773,6 +773,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 12. keep-alive
+#
+# curl is the oracle, and a good one here: %{num_connects} is curl's own
+# count of TCP connections it had to open. Give curl several URLs on one
+# command line and it reuses the connection if the server lets it -- so the
+# expected output is "1" for the first transfer and "0" for every one after.
+# Nothing about this is visible in a status code.
+# ---------------------------------------------------------------------------
+# tconn NAME WANT-DIGITS [curl args...]
+#
+# Every URL needs its own -o: curl maps -o options to URLs positionally, so a
+# single "-o /dev/null" sends the first body to the bin and every later body
+# to stdout -- where it lands in the middle of the %{num_connects} digits
+# this assertion reads. That is how it failed the first time.
+tconn() {
+	_n=$1; _w=$2; shift 2
+	_g=$(curl --http1.1 -sS --max-time "$MT" \
+	         -w '%{num_connects}' "$@" 2>&1)
+	if [ "$_g" = "$_w" ]; then ok "keep: $_n"
+	else bad "keep: $_n" "want num_connects [$_w], got [$_g]"; fi
+}
+N=/dev/null
+
+tconn 'two requests, one connection'  10 -o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn 'five requests, one connection' 10000 \
+	-o $N "$U/ok.txt" -o $N "$U/a.css" -o $N "$U/a.js" \
+	-o $N "$U/sub/deep.txt" -o $N "$U/index.html"
+tconn 'HEAD then GET reuse'           10 -I -o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn 'a 206 does not close'          10 -H 'Range: bytes=0-3' \
+	-o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn '304 does not close'            10 -H "If-Modified-Since: $LM" \
+	-o $N "$U/ok.txt" -o $N "$U/ok.txt"
+# A body on the first request must be drained, or the second request is read
+# out of the first one's body.
+tconn 'after a CL body'               10 -X GET -d 'hello' \
+	-o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn 'after a chunked body'          10 -X GET \
+	-H 'Transfer-Encoding: chunked' -d 'hello' \
+	-o $N "$U/ok.txt" -o $N "$U/a.css"
+# ... and the controls: Connection: close really does close, so curl has to
+# open a second connection.
+tconn 'Connection: close closes'      11 -H 'Connection: close' \
+	-o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn 'HTTP/1.0 closes by default'    11 --http1.0 \
+	-o $N "$U/ok.txt" -o $N "$U/a.css"
+tconn 'HTTP/1.0 + keep-alive reuses'  10 --http1.0 \
+	-H 'Connection: keep-alive' -o $N "$U/ok.txt" -o $N "$U/a.css"
+# A refusal closes, deliberately: it is answered before the body drainer has
+# run, so the connection cannot be trusted to hold another request.
+tconn '404 closes'                    11 -o $N "$U/nope" -o $N "$U/ok.txt"
+
+thdr 'keep: Connection: keep-alive sent' '^Connection: keep-alive' /ok.txt
+thdr 'keep: Connection: close honoured'  '^Connection: close' /ok.txt \
+     -H 'Connection: close'
+
+# Pipelining: two requests in one write, two responses, in order. This is
+# the assertion that the body drainer leaves the stream aligned -- the
+# chunked body of the first request must not be read as the second request.
+rawcount() {   # rawcount NAME WANT-RESPONSES REQUEST
+	raw "$3"
+	_g=$(grep -c '^HTTP/1\.1 ' "$TD/raw")
+	if [ "$_g" = "$2" ]; then ok "pipeline: $1"
+	else bad "pipeline: $1" "want $2 responses, got $_g" \
+	         "$(head -c 400 "$TD/raw")"; fi
+}
+rawcount 'two GETs in one write' 2 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+rawcount 'three GETs in one write' 3 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /ok.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /ok.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+rawcount 'chunked body then a GET' 2 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+rawcount 'CL body then a GET' 2 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+# The smuggling shape: if the body were NOT drained, "GET /secret" inside it
+# would be answered as a second request. Exactly one response, and the
+# second "request" stays a body.
+rawcount 'body is not a request' 1 \
+	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 39\r\n\r\nGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
