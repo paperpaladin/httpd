@@ -15,6 +15,9 @@ server's behaviour matters, so this exists to be the incorrect client.
              SO_LINGER 0 so the kernel sends RST. This is how a client that
              walks away mid-response is simulated, and the only way to make
              the server's next write(2) fail with EPIPE or ECONNRESET.
+--linger S   after a complete response, watch the connection for S seconds
+             and print CLOSED or OPEN. This is how "the server reaped an
+             idle keep-alive connection" is observed from the outside.
 --timeout S  socket timeout, default 10s. There is always one: a test that
              can block forever on a read is worse than a test that fails.
 
@@ -31,6 +34,7 @@ port = int(args.pop(0))
 keep = False
 drip = None
 abort = None
+linger = None
 timeout = 10.0
 while args:
     a = args.pop(0)
@@ -38,6 +42,9 @@ while args:
         keep = True
     elif a == "--abort":
         abort = int(args.pop(0))
+    elif a == "--linger":
+        linger = float(args.pop(0))
+        keep = True
     elif a == "--drip":
         drip = float(args.pop(0)) / 1000.0
     elif a == "--timeout":
@@ -93,6 +100,12 @@ try:
     except socket.timeout:
         sys.stdout.buffer.write(out)
         sys.exit(4)
+    if linger is not None:
+        s.settimeout(linger)
+        try:
+            sys.stdout.buffer.write(b"CLOSED\n" if not s.recv(1) else b"DATA\n")
+        except socket.timeout:
+            sys.stdout.buffer.write(b"OPEN\n")
 finally:
     s.close()
 
