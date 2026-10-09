@@ -6,11 +6,15 @@ space before a colon, send two conflicting Content-Length headers, or dribble
 a request line one byte per second. Those are exactly the cases where a
 server's behaviour matters, so this exists to be the incorrect client.
 
-    raw.py PORT [--keep] [--drip MS] [--timeout S] < request-bytes
+    raw.py PORT [--keep] [--drip MS] [--abort N] [--timeout S] < request
 
 --keep       leave the write side open after sending (the server must decide
              the request is complete from its framing, not from EOF)
 --drip MS    send one byte at a time, MS milliseconds apart -- slow loris
+--abort N    read at most N bytes of the response, then close the socket with
+             SO_LINGER 0 so the kernel sends RST. This is how a client that
+             walks away mid-response is simulated, and the only way to make
+             the server's next write(2) fail with EPIPE or ECONNRESET.
 --timeout S  socket timeout, default 10s. There is always one: a test that
              can block forever on a read is worse than a test that fails.
 
@@ -18,6 +22,7 @@ Prints the response bytes on stdout. Exits 0 if anything came back, 3 if the
 server closed without sending a byte, 4 on timeout.
 """
 import socket
+import struct
 import sys
 import time
 
@@ -25,11 +30,14 @@ args = sys.argv[1:]
 port = int(args.pop(0))
 keep = False
 drip = None
+abort = None
 timeout = 10.0
 while args:
     a = args.pop(0)
     if a == "--keep":
         keep = True
+    elif a == "--abort":
+        abort = int(args.pop(0))
     elif a == "--drip":
         drip = float(args.pop(0)) / 1000.0
     elif a == "--timeout":
@@ -47,6 +55,21 @@ try:
         for i in range(len(data)):
             s.sendall(data[i : i + 1])
             time.sleep(drip)
+    if abort is not None:
+        got = b""
+        while len(got) < abort:
+            b = s.recv(min(4096, abort - len(got)))
+            if not b:
+                break
+            got += b
+        # SO_LINGER with a zero timeout makes close() send RST instead of
+        # FIN, so the server is mid-body with a peer that is not merely
+        # finished but gone.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("ii", 1, 0))
+        s.close()
+        sys.stdout.buffer.write(got)
+        sys.exit(0)
     if not keep:
         s.shutdown(socket.SHUT_WR)
     out = b""

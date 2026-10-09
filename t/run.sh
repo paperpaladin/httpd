@@ -853,6 +853,104 @@ rawcount 'body is not a request' 1 \
 	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 39\r\n\r\nGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
 
 # ---------------------------------------------------------------------------
+# 13. concurrency, and clients that misbehave
+#
+# One process, one thread, poll(2). None of the properties in this section
+# are visible in a single request's status code: the question is whether the
+# server is still there afterwards.
+# ---------------------------------------------------------------------------
+# 100 simultaneous connections through curl --parallel. Each transfer gets
+# its own -o line in the config file, and the assertion counts the 200s --
+# "curl exited 0" would also be true if it had run them one at a time.
+: >"$TD/par.cfg"
+i=0
+while [ "$i" -lt 100 ]; do
+	printf 'url = "%s/big.bin"\noutput = "%s"\nrange = "0-4095"\n' \
+	       "$U" "$TD/par.$i" >>"$TD/par.cfg"
+	i=$((i + 1))
+done
+curl --http1.1 -sS --max-time 60 --parallel --parallel-max 100 \
+     -K "$TD/par.cfg" -w '%{http_code}\n' >"$TD/par.out" 2>"$TD/par.err"
+_n=$(grep -c '^206$' "$TD/par.out")
+if [ "$_n" = 100 ]; then ok 'conc: 100 parallel transfers all 206'
+else bad 'conc: 100 parallel transfers all 206' \
+         "only $_n of 100 were 206" "$(head -3 "$TD/par.err")"; fi
+# ... and every one of them got the right 4096 bytes.
+head -c 4096 "$BIG" >"$TD/par.want"
+_bad=0
+i=0
+while [ "$i" -lt 100 ]; do
+	cmp -s "$TD/par.want" "$TD/par.$i" || _bad=$((_bad + 1))
+	i=$((i + 1))
+done
+if [ "$_bad" = 0 ]; then ok 'conc: all 100 bodies byte-identical'
+else bad 'conc: all 100 bodies byte-identical' "$_bad of 100 differed"; fi
+
+# 100 connections held open at once, each doing two keep-alive requests, as
+# background curls rather than one parallel curl -- a different shape of
+# concurrency, and the one that fills the poll(2) array from 100 separate
+# processes.
+i=0
+BGPIDS=
+while [ "$i" -lt 100 ]; do
+	curl --http1.1 -sS --max-time 30 -o /dev/null "$U/ok.txt" \
+	     -o /dev/null "$U/a.css" -w '%{num_connects}' \
+	     >"$TD/bg.$i" 2>&1 &
+	BGPIDS="$BGPIDS $!"
+	i=$((i + 1))
+done
+# NOT a bare `wait`: the server is a background job of this same shell, so
+# `wait` with no arguments waits for httpd too and the suite hangs forever.
+# That is exactly the failure mode the Makefile promises cannot happen, and
+# it happened here first.
+for _p in $BGPIDS; do wait "$_p"; done
+# Per file, not `cat ... | grep -c`: curl's -w output has no trailing
+# newline, so concatenating a hundred of them makes one 200-character line
+# and the count is always 0.
+_reuse=0
+i=0
+while [ "$i" -lt 100 ]; do
+	[ "$(cat "$TD/bg.$i")" = 10 ] && _reuse=$((_reuse + 1))
+	i=$((i + 1))
+done
+if [ "$_reuse" = 100 ]; then ok 'conc: 100 background curls, all reused'
+else bad 'conc: 100 background curls, all reused' \
+         "$_reuse of 100 reported num_connects 10" "$(cat "$TD/bg".0)"; fi
+
+# A client that walks away in the middle of a 10MB response. raw.py --abort
+# reads 100 bytes and then closes with SO_LINGER 0, so the kernel sends RST
+# and the server's next write(2) fails. Five times, because the first one
+# could be survived by luck.
+_ok=1
+i=0
+while [ "$i" -lt 5 ]; do
+	printf '%b' "GET /big.bin HTTP/1.1\r\nHost: x\r\n\r\n" \
+		| python3 "$ROOT/t/raw.py" "$PORT" --abort 100 >/dev/null 2>&1 \
+		|| _ok=0
+	i=$((i + 1))
+done
+if [ "$_ok" = 1 ] && kill -0 "$SRV" 2>/dev/null; then
+	ok 'conc: survives 5 mid-response disconnects'
+else
+	bad 'conc: survives 5 mid-response disconnects' \
+	    "server alive: $(kill -0 "$SRV" 2>/dev/null && echo yes || echo NO)"
+fi
+# And it still works afterwards, which "still running" alone does not prove.
+tbody 'conc: serves correctly after RSTs' 'plain text ok' /ok.txt
+
+# SIGPIPE. Writing to a peer that has gone must be an errno and not a
+# signal, and the kernel is the authority on whether this process is
+# ignoring it: bit 12 of SigIgn in /proc/PID/status is signal 13.
+_mask=$(sed -n 's/^SigIgn:\s*//p' "/proc/$SRV/status" 2>/dev/null)
+if [ -n "$_mask" ] && [ "$(python3 -c "print(int('$_mask', 16) >> 12 & 1)")" = 1 ]
+then
+	ok 'conc: SIGPIPE is ignored (per /proc/PID/status)'
+else
+	bad 'conc: SIGPIPE is ignored (per /proc/PID/status)' \
+	    "SigIgn mask is [$_mask]"
+fi
+
+# ---------------------------------------------------------------------------
 # the server is still alive after everything above
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
