@@ -50,6 +50,7 @@ struct req {
 	int   minor;          /* HTTP/1.minor */
 	char *head;           /* first header line, or NULL */
 	long long clen;       /* Content-Length, or -1 if absent */
+	const char *ims;      /* If-Modified-Since, unparsed */
 	int   te_chunked;     /* Transfer-Encoding: chunked */
 	int   te_seen;
 	int   nhost;
@@ -272,6 +273,8 @@ static int parse_headers(char *p, struct req *r)
 			else return 501;
 		} else if (name_is(line, "host")) {
 			r->nhost++;
+		} else if (name_is(line, "if-modified-since")) {
+			r->ims = v;
 		} else if (name_is(line, "connection")) {
 			if (strcasestr(v, "close")) r->want_close = 1;
 			if (strcasestr(v, "keep-alive")) r->want_keep = 1;
@@ -410,6 +413,42 @@ static int resolve(const char *target, char *out, size_t outsz)
 	return 0;
 }
 
+/* ---- HTTP dates ---------------------------------------------------------- */
+/*
+ * RFC 9110 5.6.7 defines one format to send -- IMF-fixdate -- and three to
+ * accept, the other two being obsolete and still in the wild. All three are
+ * tried here, because the alternative is answering 200 to a conditional
+ * request that an old client framed correctly for its own era.
+ *
+ * An unparseable date is NOT an error. RFC 9110 13.1.3: "A recipient MUST
+ * ignore the If-Modified-Since header field if the received field-value is
+ * not a valid HTTP-date". Refusing it with 400 would be the natural thing to
+ * do in a program whose other rule is to refuse everything odd, and it would
+ * be wrong.
+ */
+static int parse_http_date(const char *s, time_t *out)
+{
+	static const char *fmt[] = {
+		"%a, %d %b %Y %H:%M:%S GMT",    /* IMF-fixdate */
+		"%A, %d-%b-%y %H:%M:%S GMT",    /* obsolete RFC 850 */
+		"%a %b %d %H:%M:%S %Y",         /* obsolete asctime() */
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof fmt / sizeof fmt[0]; i++) {
+		struct tm tm;
+		char *end;
+
+		memset(&tm, 0, sizeof tm);
+		end = strptime(s, fmt[i], &tm);
+		if (end && !*end) {
+			*out = timegm(&tm);
+			return 0;
+		}
+	}
+	return -1;
+}
+
 /* ---- Content-Type -------------------------------------------------------- */
 /*
  * By extension, and only by extension. Sniffing the content is what makes a
@@ -474,7 +513,7 @@ static void refill(struct conn *c)
 
 static void serve(struct conn *c, struct req *r, const char *path)
 {
-	char date[64], idx[PATH_MAX];
+	char date[64], lmod[64], idx[PATH_MAX];
 	const char *served = path;
 	struct stat st;
 	int fd;
@@ -534,9 +573,35 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	}
 
 	date_hdr(date, sizeof date, time(NULL));
+	date_hdr(lmod, sizeof lmod, st.st_mtime);
+
+	/* Conditional GET. RFC 9110 13.1.3: 304 when the representation has
+	 * not been modified since the date given. Comparison is at
+	 * one-second resolution because that is all an HTTP-date carries, so
+	 * `mtime <= ims` and not `<`. */
+	if (r->ims) {
+		time_t ims;
+
+		if (parse_http_date(r->ims, &ims) == 0 && st.st_mtime <= ims) {
+			close(fd);
+			c->outlen = c->outoff = 0;
+			out_add(c, "HTTP/1.1 304 Not Modified\r\n");
+			out_add(c, "Date: %s\r\n", date);
+			out_add(c, "Last-Modified: %s\r\n", lmod);
+			/* No Content-Length and no body: a 304 that claims a
+			 * length desynchronises a keep-alive connection. */
+			out_add(c, "Connection: close\r\n\r\n");
+			c->filefd = -1;
+			c->closing = 1;
+			c->state = S_WRITE;
+			return;
+		}
+	}
+
 	c->outlen = c->outoff = 0;
 	out_add(c, "HTTP/1.1 200 OK\r\n");
 	out_add(c, "Date: %s\r\n", date);
+	out_add(c, "Last-Modified: %s\r\n", lmod);
 	out_add(c, "Content-Type: %s\r\n", ctype(served));
 	out_add(c, "Content-Length: %lld\r\n", (long long)st.st_size);
 	out_add(c, "Connection: close\r\n\r\n");
