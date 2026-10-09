@@ -55,6 +55,19 @@ ln -s "$TD"            "$R/escapedir"   # symlink to the directory above it
 ln -s ok.txt           "$R/inside"      # symlink that stays inside: allowed
 mkfifo "$R/fifo" 2>/dev/null || true
 
+# 10MB of deterministic pseudo-random bytes: every byte value, no structure,
+# and reproducible so a failure can be looked at twice. This is the file the
+# byte-for-byte assertions use, and it is far larger than the 64KB output
+# buffer, so serving it has to survive dozens of partial writes.
+BIG="$R/big.bin"
+BIGSZ=10485760
+python3 - "$BIG" "$BIGSZ" <<'PYBIG'
+import random, sys
+random.seed(20261009)
+with open(sys.argv[1], "wb") as f:
+    f.write(bytes(random.getrandbits(8) for _ in range(int(sys.argv[2]))))
+PYBIG
+
 # ---------------------------------------------------------------------------
 # the server under test
 # ---------------------------------------------------------------------------
@@ -369,6 +382,31 @@ elif grep -q "$SECRET" "$TD/allbodies"; then
 else
 	ok 'deny: secret never served'
 fi
+
+# ---------------------------------------------------------------------------
+# 6. byte-for-byte integrity
+#
+# cmp(1) is the oracle, not a checksum written here. A 10MB body does not fit
+# in the 64KB output buffer, so this is also the only assertion that proves
+# the partial-write pump works: it takes at least 160 refills, and any
+# off-by-one in the offset arithmetic shows up as a byte that differs.
+# ---------------------------------------------------------------------------
+dl() { curl --http1.1 -sS --max-time 60 -o "$TD/dl" -D "$TD/h" "$@"; }
+
+if dl "$U/big.bin" && cmp -s "$BIG" "$TD/dl"; then
+	ok 'big: 10MB served byte for byte'
+else
+	bad 'big: 10MB served byte for byte' "$(cmp "$BIG" "$TD/dl" 2>&1)"
+fi
+if grep -q "^Content-Length: $BIGSZ" "$TD/h"; then
+	ok 'big: Content-Length is the file size'
+else
+	bad 'big: Content-Length is the file size' "$(cat "$TD/h")"
+fi
+# ... and the bytes curl received are exactly Content-Length of them.
+_n=$(wc -c <"$TD/dl")
+if [ "$_n" = "$BIGSZ" ]; then ok 'big: body length matches'
+else bad 'big: body length matches' "want $BIGSZ bytes, got $_n"; fi
 
 # ---------------------------------------------------------------------------
 # the server is still alive after everything above
