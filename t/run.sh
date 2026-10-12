@@ -147,6 +147,43 @@ tstatus() {
 	esac
 }
 
+# terr NAME CODE REASON PATH [curl args...] -- the whole refusal, not just
+# the three digits.
+#
+# Every refusal assertion in this suite checked the status code and nothing
+# else. Stripping the reason phrase, the Content-Type and the entire body from
+# `reply()` -- so each of 400, 403, 404, 405, 408, 413, 414, 431, 501 and 505
+# went out as "HTTP/1.1 400 \r\nDate: ...\r\nContent-Length: 0\r\n\r\n"
+# with no body at all -- left 226 passed, 0 failed. Successful responses are
+# verified byte for byte (tbody, cmp on the 10MB fixture, cmp on 18 ranges);
+# the refusals, which is where the security and RFC 9112 claims live, were
+# three digits deep.
+#
+# reply() emits "CODE reason\n" as a text/plain body, so that is what this
+# asserts, along with the reason phrase appearing in the status line and a
+# Content-Length matching the body it sent.
+terr() {
+	_n=$1; _c=$2; _r=$3; shift 3
+	fetch "$@"
+	if [ "$ST" != "$_c" ]; then
+		bad "$_n" "want status $_c, got $ST" "$(cat "$TD/curlerr")"
+		return
+	fi
+	_want="$_c $_r"
+	_body=$(cat "$TD/b")
+	_clen=$(sed -n 's/^[Cc]ontent-[Ll]ength: *\([0-9]*\).*/\1/p' "$TD/h" | tr -d '\r')
+	_ctype=$(sed -n 's/^[Cc]ontent-[Tt]ype: *//p' "$TD/h" | tr -d '\r')
+	if [ "$_body" != "$_want" ]; then
+		bad "$_n" "body is [$_body], want [$_want]"
+	elif [ "$_clen" != "$((${#_want} + 1))" ]; then
+		bad "$_n" "Content-Length is [$_clen], want $((${#_want} + 1))"
+	elif [ "$_ctype" != "text/plain" ]; then
+		bad "$_n" "Content-Type is [$_ctype], want text/plain"
+	else
+		ok "$_n"
+	fi
+}
+
 # tbody NAME WANT-EXACT PATH [curl args...]
 tbody() {
 	_n=$1; _w=$2; shift 2
@@ -201,8 +238,16 @@ thdr    'root: has Content-Length' '^Content-Length: [0-9]'  /
 
 # The announced port is the port it is actually listening on -- otherwise
 # every assertion above would be against some other process.
-if [ "$ST" != "curl-exit-7" ]; then ok 'port: announced port accepts'
-else bad 'port: announced port accepts' 'connection refused'; fi
+#
+# This was `[ "$ST" != "curl-exit-7" ]`, which passes on anything that is not
+# "connection refused": a 404, a 500, a timeout -- and on curl being absent
+# altogether, where $ST is "curl-exit-127". Removing curl from PATH gave 147
+# failures and this assertion was among the 79 that still passed, which is the
+# one circumstance in which it means nothing at all. $ST here is the status
+# from the immediately preceding `thdr ... /` request, so 200 is the answer
+# and anything else wants explaining.
+if [ "$ST" = 200 ]; then ok 'port: announced port accepts'
+else bad 'port: announced port accepts' "GET / on the announced port gave $ST"; fi
 
 # ---------------------------------------------------------------------------
 # 2. the request line (RFC 9112 section 3)
@@ -229,10 +274,16 @@ traw 'empty method'               400 " / HTTP/1.1\r\nHost: x\r\n\r\n"
 
 # An over-long request line must be refused by the code, not by the stack.
 # 414 is the RFC 9110 code for exactly this; a header *section* that overflows
-# the buffer is 431. Both are accepted here so the assertion is about
-# refusing rather than about which refusal.
+# the buffer is 431.
+#
+# These used to accept '414 431 400' and '431 400', on the reasoning that the
+# assertion is about refusing rather than about which refusal. But PLAN.md
+# lists both codes as part of the contract and httpd really answers them --
+# measured, 414 and 431 -- so collapsing `return 414` and `return 431` to 400
+# in httpd.c left the suite green about a contract it had stopped meeting.
+# Pinned, and checked all the way through the body.
 LONG=$(python3 -c 'print("a" * 5000)')
-tstatus 'reqline: over-long target' '414 431 400' "/$LONG"
+terr 'reqline: over-long target is 414' 414 'URI Too Long' "/$LONG"
 MANY=""
 i=0
 while [ "$i" -lt 200 ]; do
@@ -240,7 +291,7 @@ while [ "$i" -lt 200 ]; do
 	i=$((i + 1))
 done
 # shellcheck disable=SC2086
-tstatus 'reqline: over-long header section' '431 400' / $MANY
+terr 'reqline: over-long header section is 431' 431 'Request Header Fields Too Large' / $MANY
 
 # ---------------------------------------------------------------------------
 # 3. the header section, and the two request smuggling primitives
@@ -590,7 +641,14 @@ i = d.find(b"\r\n\r\n")
 print(len(d) - i - 4 if i >= 0 else -1)' "$TD/raw")
 if [ "$_n" = 0 ]; then ok 'cond: 304 has no body'
 else bad 'cond: 304 has no body' "got $_n bytes after the headers"; fi
-if grep -qi '^Content-Length:' "$TD/raw"; then
+# A negative grep over a file that may be empty is the textbook vacuous
+# assertion: replacing t/raw.py with `sys.exit(0)` left this one green among
+# 71 loud failures. The response has to exist before its headers can be
+# checked for an absence.
+if ! grep -qi '^HTTP/1\.[01] 304' "$TD/raw"; then
+	bad 'cond: 304 has no Content-Length' \
+	    "no 304 status line in the response at all" "$(head -c 200 "$TD/raw")"
+elif grep -qi '^Content-Length:' "$TD/raw"; then
 	bad 'cond: 304 has no Content-Length' "$(head -c 200 "$TD/raw")"
 else
 	ok 'cond: 304 has no Content-Length'
@@ -927,18 +985,29 @@ else bad 'conc: 100 background curls, all reused' \
 # reads 100 bytes and then closes with SO_LINGER 0, so the kernel sends RST
 # and the server's next write(2) fails. Five times, because the first one
 # could be survived by luck.
+# Each abort has to have actually read something, or this asserts only that
+# raw.py exits 0 and the server is alive -- which `sys.exit(0)` in place of
+# t/raw.py satisfies, no connection required. --abort 100 reads 100 bytes
+# before resetting, so 100 bytes is what each round must report.
 _ok=1
+_got=0
 i=0
 while [ "$i" -lt 5 ]; do
-	printf '%b' "GET /big.bin HTTP/1.1\r\nHost: x\r\n\r\n" \
-		| python3 "$ROOT/t/raw.py" "$PORT" --abort 100 >/dev/null 2>&1 \
-		|| _ok=0
+	if printf '%b' "GET /big.bin HTTP/1.1\r\nHost: x\r\n\r\n" \
+		| python3 "$ROOT/t/raw.py" "$PORT" --abort 100 >"$TD/abort.out" 2>&1
+	then
+		_n=$(wc -c < "$TD/abort.out")
+		[ "$_n" -ge 100 ] && _got=$((_got + 1))
+	else
+		_ok=0
+	fi
 	i=$((i + 1))
 done
-if [ "$_ok" = 1 ] && kill -0 "$SRV" 2>/dev/null; then
+if [ "$_ok" = 1 ] && [ "$_got" = 5 ] && kill -0 "$SRV" 2>/dev/null; then
 	ok 'conc: survives 5 mid-response disconnects'
 else
 	bad 'conc: survives 5 mid-response disconnects' \
+	    "$_got of 5 rounds read their 100 bytes" \
 	    "server alive: $(kill -0 "$SRV" 2>/dev/null && echo yes || echo NO)"
 fi
 # And it still works afterwards, which "still running" alone does not prove.
@@ -1017,11 +1086,19 @@ else
 	# 2.16s, which left 160ms of margin and failed intermittently under
 	# load. The deadline is the thing under test, not the clock's
 	# resolution.
+	# 408 is the refusal. An empty $RST2 -- no response at all -- used to
+	# be accepted here too, which means a raw client that did nothing
+	# passed: t/raw.py replaced by `sys.exit(0)` left this green. httpd
+	# does answer 408, so that is what is required; a closed connection
+	# with no status line is a different behaviour and wants saying.
 	raw2 "$REQ" --drip 100
-	if [ "$RST2" = 408 ] || [ -z "$RST2" ]; then
-		ok 'loris: 60ms/byte drip is refused'
+	if [ "$RST2" = 408 ]; then
+		ok 'loris: 100ms/byte drip is refused'
+	elif [ -z "$RST2" ]; then
+		bad 'loris: 100ms/byte drip is refused' \
+		    "no response at all -- the connection closed without a status line"
 	else
-		bad 'loris: 60ms/byte drip is refused' \
+		bad 'loris: 100ms/byte drip is refused' \
 		    "got [$RST2], which means the deadline was reset by each byte"
 	fi
 
@@ -1081,6 +1158,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # the server is still alive after everything above
+# --------------------------------------------------- the refusals, in full
+# Every assertion above checks a refusal's status code. None checked the rest
+# of the response -- so stripping the reason phrase, the Content-Type and the
+# whole body out of `reply()` left 226 passed, 0 failed. These check what
+# reply() actually sends: the reason phrase in the status line, the
+# "CODE reason" body, a Content-Length that matches it, and text/plain.
+#
+# Only the codes curl can provoke on its own are here; the ones that need a
+# hand-built request (400, 408, 501, 505) are driven through traw elsewhere
+# and reach the same reply().
+terr 'refusal in full: 404' 404 'Not Found'            /nope.txt
+terr 'refusal in full: 403' 403 'Forbidden'            /.hidden
+terr 'refusal in full: 405' 405 'Method Not Allowed'   / -X POST
+terr 'refusal in full: 413' 413 'Content Too Large'    /ok.txt -X GET \
+	-H 'Content-Length: 2097152' --data-binary @"$TD/2mb"
+
 # ---------------------------------------------------------------------------
 if kill -0 "$SRV" 2>/dev/null; then ok 'server: still running'
 else bad 'server: still running' "it died; stderr: $(cat "$TD/log")"; fi

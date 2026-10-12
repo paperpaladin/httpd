@@ -103,7 +103,7 @@ refused.
 | `/fifo` (a FIFO inside the root) | 403 | `serve: a fifo is not a doc` |
 
 A symlink that stays **inside** the root is served (`serve: symlink inside
-root`), because it is a document and not an escape. Sixteen assertions for what
+root`), because it is a document and not an escape. Fifteen assertions for what
 the resolver must still serve come before the refusals in the file, for the
 reason that a resolver which refuses everything satisfies every refusal test
 ever written.
@@ -159,7 +159,9 @@ server on a real socket, and the thing asserted is the status code curl
 reports, the header block curl saved, or the bytes curl wrote to a file.
 Nothing in the suite inspects httpd's memory or trusts it about anything.
 
-Five other outside authorities are used where curl cannot answer:
+Four other outside authorities are used where curl cannot answer. The table
+below lists five rows, and the first is curl itself -- `raw.py` is ours, which
+the section above says plainly, so it is not among them:
 
 | Oracle | What it decides | Why it is independent |
 | --- | --- | --- |
@@ -256,7 +258,7 @@ however busily the client dribbles, and past that it gets 408. While a
 *response* is being written the deadline is the ordinary idle one measured
 from the last byte that moved, because a 10MB body legitimately takes a while
 and a slow reader is a customer rather than an attack. `-t` defaults to 10
-seconds. Six assertions, including the two controls that a one-second server
+seconds. Eight assertions, including the two controls that a one-second server
 still answers a normal request and one dripped at 5ms per byte.
 
 ## Where curl or the RFC contradicted an assumption
@@ -307,7 +309,7 @@ still answers a normal request and one dripped at 5ms per byte.
 ```
 httpd.c      the server, one file
 Makefile     build, test, test-asan, clean
-t/run.sh     the suite; prints "N passed, M failed"
+t/run.sh     the suite; prints "N passed, M failed, K skipped"
 t/raw.py     a deliberately incorrect HTTP client, for requests curl will not send
 t/tmp/       scratch: document root, the 10MB fixture, the secret file. Not committed.
 PLAN.md      contract, invariant, ranked oracles, non-goals, commit sequence
