@@ -52,7 +52,7 @@ Two halves, and both are checked by something outside this program.
    `open(2)`. Percent-decoding happens exactly once, so `%252e` is a filename
    and not a traversal; a `..` segment is refused, not popped; and
    `realpath(3)` of the result must still begin with the `realpath(3)` of the
-   document root, which is the only check that can see a symlink. A secret
+   document root, the only check that can see a symlink. A secret
    file outside the root, a symlink to it inside the root, and a symlink to
    the parent directory inside the root are the oracle: 35 attacks each assert
    a refusing status code AND that the secret string is absent from the body,
@@ -174,7 +174,7 @@ existed at that point.
       exercises the partial-write pump, and a checksum computed by the same
       program that served the bytes proves nothing.
 - [x] `Content-Type` from the extension, cross-checked against `file(1)`.
-      why: `file(1)` answers the same question from the content, which is the
+      why: `file(1)` answers the same question from the content, and that is the
       only independent check available for a lookup table.
 - [x] HEAD: identical headers, not one body byte.
       why: "identical" is the part that gets implemented wrongly.
@@ -191,7 +191,7 @@ existed at that point.
       rule, which is easy to get backwards.
 - [x] Request bodies: `Content-Length` and chunked, read and discarded.
       why: a body that is not read is not gone. It becomes the next request on
-      a keep-alive connection, which is the other half of smuggling.
+      a keep-alive connection, the other half of smuggling.
 - [x] Keep-alive and pipelining, with `num_connects` as the oracle.
       why: "the connection stayed open" and "the connection was reopened and
       nobody noticed" produce identical status codes.
