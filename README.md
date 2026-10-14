@@ -34,14 +34,14 @@ proved:
 
 1. Percent-decoding happens exactly once. `%2e%2e%2f` becomes `../` and is
    then caught by layer 2. `%252e%252e%252f` becomes the literal nine-byte
-   segment `%2e%2e%2f`, which is a filename and not a traversal, so the
+   segment `%2e%2e%2f`, a filename and no traversal at all, so the
    correct answer for the double-encoded form is 404, because no such file
    exists. Decoding in a loop until the string stops changing is the bug that
    makes double encoding work, so there is no loop.
 2. A `..` segment is refused, not popped. Popping is what a normaliser
    does, and a normaliser has to be correct about every encoding of every
    separator in order to be safe. Refusing has to be correct about one string.
-   Any segment beginning with `.` is refused as well, which is also the
+   Any segment beginning with `.` is refused as well, by the same
    no-dotfiles rule.
 3. `realpath(3)` containment. The resolved path must still begin with the
    document root, which is itself `realpath`'d once at startup. This is the
@@ -266,10 +266,10 @@ still answers a normal request and one dripped at 5ms per byte.
 - curl normalises `%2e` away. `curl 'http://h/%2e%2e/secret.txt'`
   percent-decodes the `%2e`, removes the resulting dot segment, and sends
   `GET /secret.txt`, confirmed with `curl -v`. The traversal assertion was
-  passing on a 404 for a file that does not exist, which is a green test for a
-  request that was never made. `--path-as-is` is required. curl does *not* do
-  this when the separator is also encoded (`%2e%2e%2f`), which is why only two
-  of the ten encoded cases were affected.
+  passing on a 404 for a file that does not exist, a green test for a request
+  that was never made. `--path-as-is` is required. curl does *not* do
+  this when the separator is also encoded (`%2e%2e%2f`), so only two of the ten
+  encoded cases were affected.
 - An invalid `If-Modified-Since` must be ignored, not refused. RFC 9110
   13.1.3 is explicit. Everywhere else in this program, something odd on the
   wire is a 400. Here it has to be a 200 with the full body.
@@ -302,7 +302,7 @@ still answers a normal request and one dripped at 5ms per byte.
   server correctly sat waiting for a terminator that never came.
 - A bare `wait` in the harness waits for the server too, since it is a
   background job of the same shell. The suite hung until the outer timeout
-  killed it, which is the one thing `make test` promises cannot happen.
+  killed it, the one thing `make test` promises cannot happen.
 
 ## Files
 
