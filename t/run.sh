@@ -955,7 +955,324 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 11. request bodies: Content-Length and chunked
+# 11. If-Range (RFC 9110 13.1.5)
+#
+# The only conditional in this program whose absence corrupts data instead of
+# producing a wrong status code. A client resumes an interrupted download by
+# sending Range: bytes=N-; the file has been rewritten since the first
+# attempt; the tail of the new generation arrives on top of the head of the
+# old one, and the result matches neither file. The status is 206, every
+# header is correct, Content-Length agrees with the bytes that follow, and
+# nothing anywhere reports a problem. The assertion
+# `ifrange: without it, a changed file splices` sends exactly that request
+# and requires the corruption to be there, so that the two assertions after
+# it mean something.
+#
+# curl drives the resume cases itself: -C - reads the local file's length and
+# builds the Range header from it, so the offset arithmetic a resume depends
+# on is curl's and not ours, and cmp(1) decides whether the finished file is
+# a generation of the fixture or a splice of two.
+#
+# Three rules from 13.1.5 and one from 13.2.2 are what the header-level
+# assertions below are for:
+#
+#   - the entity-tag comparison is STRONG, so W/"x" does not match "x", which
+#     is the opposite of the If-None-Match rule twenty lines up the file;
+#   - the date comparison is EXACT, not the "earlier than or equal to" of
+#     If-Modified-Since, so a date that would have satisfied a 304 does not
+#     satisfy this;
+#   - a validator that does not match means the Range header is IGNORED and
+#     the whole representation goes out with 200. Not 412, not 416. A stale
+#     validator on an unsatisfiable range is therefore a 200 as well, which
+#     is the case that separates "ignore the header" from "ignore the 206";
+#   - If-Range is evaluated after If-None-Match, so a matching tag in
+#     If-None-Match is still a 304 on a range request.
+# ---------------------------------------------------------------------------
+
+# Two generations of one file, 4000 bytes each, same length and different
+# bytes, with the mtimes set by python rather than by the clock: the date form
+# of this header needs an mtime that is both known exactly and in the past,
+# and a fixture whose timestamp is whatever the filesystem happened to write
+# is a test that depends on winning a race.
+IFRA="$TD/gen-a"
+IFRB="$TD/gen-b"
+python3 - "$R/ifr.bin" "$IFRA" "$IFRB" <<'PYIFR'
+import os, sys
+a, b = b"A" * 4000, b"B" * 4000
+open(sys.argv[2], "wb").write(a)
+open(sys.argv[3], "wb").write(b)
+open(sys.argv[1], "wb").write(a)
+os.utime(sys.argv[1], ns=(1700000000111111111, 1700000000111111111))
+PYIFR
+
+fetch /ifr.bin
+IFR_ET=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+IFR_LM=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+
+# ---------------------------------------------------------------------------
+# which branch each request actually took
+#
+# An If-Range test whose requests do not carry If-Range passes vacuously, and
+# this suite has already been caught by a header curl did not send: the
+# "empty If-Modified-Since is ignored" assertion was green against a request
+# with no such field in it, because `-H 'Name;'` does not send an empty
+# field. So tifr reads curl's own trace of what it put on the wire and
+# refuses to make the assertion at all if If-Range and Range are not both
+# there with a value. The four counters are printed at the end of the section
+# and all four are required to be non-zero, which is the thing that fails if
+# a later edit stops exercising one of the branches.
+#
+# The kinds are the two the code branches on, and the split is 13.1.5's own:
+# a validator whose first character is a DQUOTE is an entity-tag, anything
+# else is read as a date. So `If-Range: nonsense` counts as a date, because
+# that is the path it takes through the server.
+# ---------------------------------------------------------------------------
+ifr_tag_ok=0; ifr_tag_no=0; ifr_date_ok=0; ifr_date_no=0
+
+# tifr NAME KIND WANT PATH [curl args...]
+#   KIND  tag | date
+#   WANT  200 means the validator did not match and the Range was ignored;
+#         anything else means it matched and the Range was acted on.
+tifr() {
+	_n=$1; _k=$2; _w=$3; _p=$4; shift 4
+	ST=$(curl --http1.1 -sS -v --max-time "$MT" \
+	          -o "$TD/b" -D "$TD/h" -w '%{http_code}' \
+	          "$@" "$U$_p" 2>"$TD/trace") || ST="curl-exit-$?"
+	cat "$TD/b" >>"$TD/allbodies" 2>/dev/null
+	if ! grep -qi '^> If-Range: ..*' "$TD/trace"; then
+		bad "ifrange: $_n" 'curl sent no If-Range value' \
+		    "$(grep '^> ' "$TD/trace")"
+		return
+	fi
+	if ! grep -qi '^> Range: ..*' "$TD/trace"; then
+		bad "ifrange: $_n" 'curl sent no Range value' \
+		    "$(grep '^> ' "$TD/trace")"
+		return
+	fi
+	case "$_k $_w" in
+	'tag 200')  ifr_tag_no=$((ifr_tag_no + 1)) ;;
+	'tag '*)    ifr_tag_ok=$((ifr_tag_ok + 1)) ;;
+	'date 200') ifr_date_no=$((ifr_date_no + 1)) ;;
+	'date '*)   ifr_date_ok=$((ifr_date_ok + 1)) ;;
+	*) bad "ifrange: $_n" "tifr called with kind [$_k]"; return ;;
+	esac
+	if [ "$ST" = "$_w" ]; then ok "ifrange: $_n"
+	else bad "ifrange: $_n" "want status $_w, got $ST" \
+	         "$(grep -v '^[*<>}{] ' "$TD/trace")"; fi
+}
+
+# The tag form. A matching tag is a 206 and the bytes are the range asked
+# for, so the honoured branch is checked for more than its three digits.
+tifr 'a matching tag honours the range' tag 206 /ifr.bin \
+     -H "If-Range: $IFR_ET" -H 'Range: bytes=0-9'
+head -c 10 "$IFRA" > "$TD/want"
+if cmp -s "$TD/want" "$TD/b"; then ok 'ifrange: and sends those ten bytes'
+else bad 'ifrange: and sends those ten bytes' "$(cmp "$TD/want" "$TD/b" 2>&1)"; fi
+
+tifr 'a stale tag sends the whole file' tag 200 /ifr.bin \
+     -H 'If-Range: "33-1-1-1.00000000"' -H 'Range: bytes=0-9'
+if [ "$(wc -c <"$TD/b")" = 4000 ]; then
+	ok 'ifrange: and all 4000 bytes of it'
+else
+	bad 'ifrange: and all 4000 bytes of it' "got $(wc -c <"$TD/b") bytes"
+fi
+
+# Strong comparison, 13.1.5. The weak form of this server's own tag is the
+# case that separates it from the If-None-Match rule, where the same bytes
+# DO match: a weak validator says the representations are equivalent, which
+# is not enough to cut a byte range out of one of them.
+tifr 'the weak form of our own tag does not match' tag 200 /ifr.bin \
+     -H "If-Range: W/$IFR_ET" -H 'Range: bytes=0-9'
+tifr 'a tag that is merely a prefix does not match' tag 200 /ifr.bin \
+     -H "If-Range: $(printf '%s' "$IFR_ET" | cut -c1-8)\"" \
+     -H 'Range: bytes=0-9'
+tifr 'a list of two tags is not a validator' tag 200 /ifr.bin \
+     -H "If-Range: $IFR_ET, \"other\"" -H 'Range: bytes=0-9'
+
+# The date form. Exact equality with Last-Modified, and nothing else.
+tifr 'the exact Last-Modified honours the range' date 206 /ifr.bin \
+     -H "If-Range: $IFR_LM" -H 'Range: bytes=0-9'
+tifr 'a different date does not match' date 200 /ifr.bin \
+     -H 'If-Range: Wed, 21 Oct 2015 07:28:00 GMT' -H 'Range: bytes=0-9'
+# ... including a date that If-Modified-Since would have been satisfied by,
+# which is the sentence 13.1.5 ends on: this comparison is by exact match and
+# the other one is "earlier than or equal to".
+tifr 'a later date does not match either' date 200 /ifr.bin \
+     -H 'If-Range: Fri, 01 Jan 2100 00:00:00 GMT' -H 'Range: bytes=0-9'
+tifr 'an unparseable validator does not match' date 200 /ifr.bin \
+     -H 'If-Range: not a validator at all' -H 'Range: bytes=0-9'
+
+# 13.1.5 requires the condition to be false when the date is not a strong
+# validator in 8.8.2.3's sense. Half of that test is deducible from stat(2)
+# and half is not, and the half that is, is that the second the date names
+# must be over: while it is still running another write can land inside it
+# and the date will not change. The mtime is set 60 seconds ahead rather
+# than by writing the file and racing the clock, because the branch is the
+# same one and this version cannot flake.
+python3 - "$R/future.txt" <<'PYFUT'
+import os, sys, time
+open(sys.argv[1], "w").write("not yet\n")
+t = int(time.time()) + 60
+os.utime(sys.argv[1], ns=(t * 10**9, t * 10**9))
+PYFUT
+fetch /future.txt
+IFR_FLM=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+tifr 'a date whose second is not over is not strong' date 200 /future.txt \
+     -H "If-Range: $IFR_FLM" -H 'Range: bytes=0-1'
+# ... and the control, so the line above is about the strongness rule and not
+# about something else being wrong with that file: the same file with its
+# mtime moved into the past does honour the range.
+python3 - "$R/future.txt" <<'PYPAST'
+import os, sys
+os.utime(sys.argv[1], ns=(1700000000333333333, 1700000000333333333))
+PYPAST
+fetch /future.txt
+IFR_PLM=$(sed -n 's/^Last-Modified: //p' "$TD/h" | tr -d '\r')
+tifr 'the same date, once that second is over, is strong' date 206 \
+     /future.txt -H "If-Range: $IFR_PLM" -H 'Range: bytes=0-1'
+
+# "Ignore the Range header field" means the whole field, not just the 206. A
+# stale validator in front of an unsatisfiable range is a 200 with the whole
+# file: the range is not there to be unsatisfiable any more. Checking
+# If-Range after parse_range instead answers 416 here, which tells the client
+# its resume failed for a reason that is not true.
+tifr 'a stale tag over an unsatisfiable range is 200' tag 200 /ifr.bin \
+     -H 'If-Range: "33-1-1-1.00000000"' -H 'Range: bytes=99999-'
+tifr 'a matching tag over the same range is still 416' tag 416 /ifr.bin \
+     -H "If-Range: $IFR_ET" -H 'Range: bytes=99999-'
+
+# 13.1.5: a server MUST ignore If-Range when the request has no Range. The
+# answer is an ordinary 200 either way, so the assertion is that no
+# Content-Range came back with it.
+fetch /ifr.bin -H 'If-Range: "33-1-1-1.00000000"'
+if [ "$ST" = 200 ] && ! grep -qi '^Content-Range:' "$TD/h"; then
+	ok 'ifrange: with no Range it is ignored'
+else
+	bad 'ifrange: with no Range it is ignored' "status $ST" "$(cat "$TD/h")"
+fi
+
+# 13.2.2 puts If-Range last. A matching If-None-Match is a 304 even when a
+# Range and a stale If-Range are sitting next to it, and the 304 wins over
+# both the 206 and the 200-with-everything.
+tstatus 'ifrange: a 304 beats both answers' 304 /ifr.bin \
+        -H "If-None-Match: $IFR_ET" -H 'If-Range: "33-1-1-1.00000000"' \
+        -H 'Range: bytes=0-9'
+
+# ---------------------------------------------------------------------------
+# the corruption, with curl doing the resuming
+#
+# curl -C - is the client this header exists for. It reads the length of the
+# local file, asks for the rest, and appends what arrives. cmp(1) is the
+# oracle for what the finished file is.
+# ---------------------------------------------------------------------------
+head -c 1000 "$IFRA" > "$TD/part"
+python3 - "$R/ifr.bin" "$IFRB" <<'PYGEN'
+import os, shutil, sys
+shutil.copyfile(sys.argv[2], sys.argv[1])
+os.utime(sys.argv[1], ns=(1700000000222222222, 1700000000222222222))
+PYGEN
+
+# First, with no If-Range at all, which is what curl -C - sends on its own:
+# neither curl nor wget generates this header, so this is the real default
+# behaviour of both. The assertion is that the result is corrupt, because
+# the two assertions after it are meaningless without it.
+_rc=0
+curl --http1.1 -sS --max-time "$MT" -o "$TD/part" -C - \
+     -w '%{http_code}' "$U/ifr.bin" >"$TD/w" 2>"$TD/curlerr" || _rc=$?
+if [ "$_rc" != 0 ]; then
+	bad 'ifrange: without it, a changed file splices' "curl exit $_rc" \
+	    "$(cat "$TD/curlerr")"
+elif [ "$(cat "$TD/w")" != 206 ]; then
+	bad 'ifrange: without it, a changed file splices' \
+	    "want 206, got $(cat "$TD/w")"
+elif cmp -s "$TD/part" "$IFRA" || cmp -s "$TD/part" "$IFRB"; then
+	bad 'ifrange: without it, a changed file splices' \
+	    'the resumed file is one of the two generations after all'
+elif [ "$(wc -c <"$TD/part")" != 4000 ]; then
+	bad 'ifrange: without it, a changed file splices' \
+	    "resumed file is $(wc -c <"$TD/part") bytes, want 4000"
+else
+	ok 'ifrange: without it, a changed file splices'
+fi
+
+# Now the same resume with the validator the first attempt was given. The
+# server answers 200 with the whole 4000 bytes, and curl's reaction to being
+# sent a 200 for a resume is exit 33, "HTTP server does not seem to support
+# byte ranges. Cannot resume." It writes nothing: the 1000 bytes on disk are
+# still the 1000 bytes of generation A, untouched. That is curl's own
+# verdict, not ours, and it is the whole value of the header -- a failed
+# resume instead of a corrupt file.
+head -c 1000 "$IFRA" > "$TD/part"
+_rc=0
+curl --http1.1 -sS --max-time "$MT" -o "$TD/part" -C - \
+     -H "If-Range: $IFR_ET" -w '%{http_code}' "$U/ifr.bin" \
+     >"$TD/w" 2>"$TD/curlerr" || _rc=$?
+if [ "$_rc" != 33 ]; then
+	bad 'ifrange: with it, curl refuses to resume' \
+	    "want curl exit 33, got $_rc, status $(cat "$TD/w")" \
+	    "$(cat "$TD/curlerr")"
+else
+	ok 'ifrange: with it, curl refuses to resume'
+fi
+head -c 1000 "$IFRA" > "$TD/want"
+if cmp -s "$TD/want" "$TD/part"; then
+	ok 'ifrange: and the partial file is untouched'
+else
+	bad 'ifrange: and the partial file is untouched' \
+	    "$(cmp "$TD/want" "$TD/part" 2>&1)" \
+	    "$(wc -c <"$TD/part") bytes"
+fi
+
+# And the resume that should work still works, end to end: a partial download
+# of the generation that is on disk, resumed with that generation's tag,
+# completes to a file cmp(1) cannot distinguish from it.
+fetch /ifr.bin
+IFR_ET2=$(sed -n 's/^ETag: //p' "$TD/h" | tr -d '\r')
+head -c 1000 "$IFRB" > "$TD/part"
+_rc=0
+curl --http1.1 -sS --max-time "$MT" -o "$TD/part" -C - \
+     -H "If-Range: $IFR_ET2" -w '%{http_code}' "$U/ifr.bin" \
+     >"$TD/w" 2>"$TD/curlerr" || _rc=$?
+if [ "$_rc" != 0 ]; then
+	bad 'ifrange: a resume of the current file completes' "curl exit $_rc" \
+	    "$(cat "$TD/curlerr")"
+elif [ "$(cat "$TD/w")" != 206 ]; then
+	bad 'ifrange: a resume of the current file completes' \
+	    "want 206, got $(cat "$TD/w")"
+elif cmp -s "$IFRB" "$TD/part"; then
+	ok 'ifrange: a resume of the current file completes'
+else
+	bad 'ifrange: a resume of the current file completes' \
+	    "$(cmp "$IFRB" "$TD/part" 2>&1)"
+fi
+# ... and the tag really did change between the two generations, or the
+# assertion above is a resume against a validator that never went stale.
+if [ -n "$IFR_ET" ] && [ "$IFR_ET" != "$IFR_ET2" ]; then
+	ok 'ifrange: the two generations have two tags'
+else
+	bad 'ifrange: the two generations have two tags' "both are [$IFR_ET]"
+fi
+
+# ---------------------------------------------------------------------------
+# the branch counts
+#
+# Printed because they are the answer to "did the new code path run": the
+# numbers come from requests whose If-Range curl confirmed on the wire, and
+# every one of them is paired with an asserted status above. A zero here is
+# an If-Range branch nothing reached.
+# ---------------------------------------------------------------------------
+printf 'ifrange branches: tag honoured %d, tag ignored %d, date honoured %d, date ignored %d\n' \
+       "$ifr_tag_ok" "$ifr_tag_no" "$ifr_date_ok" "$ifr_date_no"
+if [ "$ifr_tag_ok" -gt 0 ] && [ "$ifr_tag_no" -gt 0 ] &&
+   [ "$ifr_date_ok" -gt 0 ] && [ "$ifr_date_no" -gt 0 ]; then
+	ok 'ifrange: all four branches were reached'
+else
+	bad 'ifrange: all four branches were reached' \
+	    "tag $ifr_tag_ok/$ifr_tag_no, date $ifr_date_ok/$ifr_date_no"
+fi
+
+# ---------------------------------------------------------------------------
+# 12. request bodies: Content-Length and chunked
 #
 # GET has no use for a body, but a body that is not read is not gone: it
 # stays in the socket and becomes the next request on a keep-alive
@@ -1028,7 +1345,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 12. keep-alive
+# 13. keep-alive
 #
 # curl is the oracle, and a good one here: %{num_connects} is curl's own
 # count of TCP connections it had to open. Give curl several URLs on one
@@ -1108,7 +1425,7 @@ rawcount 'body is not a request' 1 \
 	"GET /ok.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 39\r\n\r\nGET /sub/deep.txt HTTP/1.1\r\nHost: x\r\n\r\n"
 
 # ---------------------------------------------------------------------------
-# 13. concurrency, and clients that misbehave
+# 14. concurrency, and clients that misbehave
 #
 # One process, one thread, poll(2). None of the properties in this section
 # are visible in a single request's status code: the question is whether the
@@ -1217,7 +1534,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 14. slow loris, and the reaping rule
+# 15. slow loris, and the reaping rule
 #
 # These need a server with a one-second deadline, so there is a second
 # instance on its own ephemeral port. Both are killed from the trap.
@@ -1329,7 +1646,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 15. nothing on stderr
+# 16. nothing on stderr
 #
 # Under `make test-asan` this is where a sanitizer report lands, and a report
 # that does not happen to kill the process would otherwise go unnoticed.

@@ -154,8 +154,8 @@ stricter-than-necessary refusal of `/sub/../ok.txt`.
 
 ## Conditional requests
 
-Two of them: `If-Modified-Since`, and `If-None-Match` against a strong
-`ETag`. Both 200 and 206 carry `Last-Modified` and `ETag`. A 304 carries
+Three: `If-Modified-Since`, `If-None-Match` against a strong `ETag`, and
+`If-Range`. Both 200 and 206 carry `Last-Modified` and `ETag`. A 304 carries
 `Last-Modified` and `ETag`, no body, and no `Content-Length`.
 
 ### The tag
@@ -215,13 +215,21 @@ the `If-None-Match` request from it, so neither the reading of the header
 nor the writing of the request is ours. The remaining assertions send
 explicit `-H 'If-None-Match: ...'` values and take curl's reported status.
 
-**No second HTTP server is installed on this machine.** Unlike
-`Content-Type`, where `file(1)` answers the same question from the content,
-there is no other implementation here to diff these answers against: the
-only authorities for this feature are curl and the RFC text. That is a
-weaker position than the rest of the suite is in, and it is written down
-rather than papered over. `wget` is installed and is a second client, but it
-has no `If-None-Match` support at all, so it cannot stand in.
+**No second HTTP server is installed on this machine.** Checked, not
+assumed: nginx, apache, lighttpd, thttpd, darkhttpd, caddy, busybox, ruby,
+php, netcat and socat are all absent. Python's `http.server` is here and is
+a second implementation, but `inspect.getsource` of it contains no
+occurrence of `Range`, `Content-Range`, `Accept-Ranges`, `If-Range` or
+`ETag`, so it implements none of this and cannot be asked whether a 206 is
+right. It does handle `If-Modified-Since`, which `date(1)` already
+cross-checks. `wget` is a second client and has no `If-None-Match` or
+`If-Range` support of its own.
+
+So unlike `Content-Type`, where `file(1)` answers the same question from the
+content, there is no other implementation here to diff these answers
+against: the authorities for the conditionals are curl, `cmp(1)` and the RFC
+text. That is a weaker position than the rest of the suite is in, and it is
+written down rather than papered over.
 
 ### Mutation testing of the conditionals
 
@@ -250,6 +258,155 @@ with no `ETag` in the 200, `curl --etag-save` writes an empty file, and the
 suite says it could not make the assertion instead of passing it.
 
 
+### If-Range, and the corruption it prevents
+
+This is the one conditional here whose absence corrupts data rather than
+producing a wrong status code. Measured against this server before the header
+existed:
+
+```
+curl -r 0-999 /ifr.bin        1000 bytes of generation A
+   (the file is rewritten: same length, different bytes)
+curl -C - -o part /ifr.bin    206, 3000 bytes downloaded
+part                          4000 bytes, 1000 of A followed by 3000 of B
+```
+
+A 206, a `Content-Length` equal to the bytes that followed, and a file that
+is neither generation. Nothing in the exchange said so. `cmp(1)` is the only thing in the suite that can see it, and the
+assertion `ifrange: without it, a changed file splices` requires the
+corruption to be there, so that the two assertions after it mean something.
+
+Neither `curl -C -` nor `wget -c` generates `If-Range` on its own. Both were
+read off the wire rather than out of the manual, curl with `-v` and wget
+against a server that echoed its request back, and both send a bare
+`Range: bytes=N-`. So the splice above is what the two installed resume
+clients do by default, and a server that cannot be told the representation
+changed has no way to stop them.
+
+#### The rules, and the two that differ from `If-None-Match`
+
+RFC 9110 13.1.5, with 13.2.2 for where it sits in the order.
+
+- An entity-tag or an HTTP-date, told apart by whether the first character is
+  a `"`. A field that is neither takes the date path, fails to parse, and does
+  not match.
+- The entity-tag comparison is **strong**. `W/"x"` does not match `"x"` here,
+  which is the opposite of the `If-None-Match` rule a few paragraphs up.
+  Weak equivalence says two representations are interchangeable for caching;
+  cutting a byte range out of one of them needs the bytes to be the same
+  bytes. A weak validator must not be used for this field at all, and since
+  `W/` fails the `"` test it reaches the date path and is rejected there.
+- The date comparison is **exact**, not the "earlier than or equal to" of
+  `If-Modified-Since`. A date later than the `Last-Modified` satisfies a 304
+  and does not satisfy this.
+- A validator that does not match means the `Range` field is ignored and the
+  whole representation goes out with 200. Not 412, not 416. The field is
+  ignored entirely rather than just its 206, so a stale validator in front of
+  an unsatisfiable range is also a 200: checking `If-Range` after the range
+  has been parsed answers 416 there, which tells the client its resume failed
+  for a reason that is not true.
+- `If-Range` with no `Range` is ignored. True here by construction, since
+  nothing reads the field outside the block that needs a range.
+- 13.2.2 evaluates it last, so a matching `If-None-Match` is still a 304 on a
+  range request carrying a stale `If-Range`.
+
+The strongness rule for dates is the part this server can only half satisfy,
+and the half it cannot is a ceiling rather than an oversight. 13.1.5 requires
+the condition to be false when the date is not a strong validator in
+8.8.2.3's sense, which asks the origin server to know the representation did
+not change twice inside the second the date names. `stat(2)` reports the last
+write and not the history, so that is not deducible here. What is deducible
+is the other direction: once the clock has left that second, nothing further
+can be written inside it. So `mtime < now` is required, and a file written
+during the current second is treated as having no strong date validator. A
+client that wants a resume to be safe inside a one-second window has to use
+the `ETag`, which is what the nanoseconds in it are for.
+
+#### The oracle: curl does the resuming, cmp decides
+
+`curl -C -` is the client this header exists for. It reads the length of the
+local partial file, builds the `Range` from it and appends what arrives, so
+the offset arithmetic a resume depends on is curl's and not ours. `cmp(1)`
+then decides what the finished file is.
+
+curl's own reaction to a declined resume is the part worth having. Sent a 200
+where it asked for a 206, curl exits 33 with "HTTP server does not seem to
+support byte ranges. Cannot resume." and writes nothing: the partial file on
+disk is byte-identical to what it was, asserted with `cmp`. That exit code is
+curl's verdict and not ours, and it is the whole value of the header. The
+resume fails loudly instead of succeeding into a corrupt file.
+
+Three assertions run end to end: the splice above, the same resume with the
+validator the first attempt was given (exit 33, partial file untouched), and
+a resume of the generation actually on disk, which completes to a file `cmp`
+cannot distinguish from it.
+
+#### Which branch each request took
+
+An `If-Range` test whose requests do not carry `If-Range` passes vacuously,
+and this suite has already been caught by a header curl did not send: the
+"empty `If-Modified-Since` is ignored" assertion was green against a request
+with no such field in it. So every header-level assertion goes through one
+wrapper that reads curl's own trace of what it put on the wire and refuses to
+make the assertion at all unless `If-Range` and `Range` are both there with a
+value. The suite prints the counts and requires all four to be non-zero:
+
+```
+ifrange branches: tag honoured 2, tag ignored 5, date honoured 2, date ignored 4
+```
+
+Thirteen requests, each one confirmed on the wire and each paired with an
+asserted status. Nine of the twenty-three assertions in the section are
+"must not refuse" cases, which is the direction this program gets wrong by
+reflex.
+
+Four mutations of the harness, to find out what that gate is worth:
+
+| Harness mutation | Verdict |
+| --- | --- |
+| drop the `If-Range` header from one asserted case | **caught**: `curl sent no If-Range value`, and the count drops to 4 |
+| send no `If-Range` argument at all on a matching case | **caught**: same, count drops to 1 |
+| delete one of the two date-honoured cases | **SURVIVES**: the branch is still reached, so the gate is still telling the truth |
+| delete both, emptying that branch | **caught**: `ifrange: all four branches were reached`, date honoured 0 |
+
+The survivor is the gate being exactly as strong as its claim and no
+stronger. It says a branch was reached, so it fires when a branch is emptied
+and not when an assertion is removed from a branch that still has one. An
+exact count would catch that and would go red every time an assertion is
+added, which is a worse trade.
+
+#### Mutation testing of If-Range
+
+Eleven mutants, each built and run through the whole suite. No survivors.
+
+| Mutation | Verdict |
+| --- | --- |
+| strip `W/` before comparing, the `If-None-Match` rule | **caught**: 1, `the weak form of our own tag does not match` |
+| reuse `inm_match`, so weak and comma-list forms both match | **caught**: 2 |
+| date comparison `<=` instead of `==` | **caught**: 1, `a later date does not match either` |
+| drop the strongness guard on the date | **caught**: 1, `a date whose second is not over is not strong` |
+| ignore `If-Range` entirely, the behaviour before this commit | **caught**: 12 |
+| a mismatch refuses with 416 instead of ignoring the `Range` | **caught**: 11 |
+| check `If-Range` after `parse_range`, so a 416 outranks the ignore rule | **caught**: 1, `a stale tag over an unsatisfiable range is 200` |
+| `If-Range` present suppresses the 304, inverting 13.2.2 | **caught**: 1, `a 304 beats both answers` |
+| a tag that is a prefix of ours matches | **caught**: 1 |
+| drop the `"` test, so every validator is read as a date | **caught**: 4 |
+| accept any validator the date parser rejects | **caught**: 2 |
+
+The two broad ones are worth separating, and the difference between their
+failure sets was read off a diff rather than guessed. "Ignore `If-Range`
+entirely" is the code as it stood before this commit and fails twelve
+assertions. "Refuse with 416" fails eleven, and the twelfth is the one it
+passes: `ifrange: and the partial file is untouched`. Both mutants are wrong
+about exactly the same requests, and both fail the assertion that curl exits
+33, so both are caught. But a wrong refusal and a wrong answer do different
+damage downstream. A 416 leaves the client's partial file alone because curl
+writes nothing for it either, while a 206 for a stale validator appends three
+thousand bytes of the wrong generation onto it. Only one of the two mutants
+corrupts a file on disk, and it is the one that answers rather than
+refuses.
+
+
 ## The oracle
 
 `curl` is the authority. Every assertion drives a real `curl` against a real
@@ -263,7 +420,7 @@ the section above says plainly, so it is not among them:
 
 | Oracle | What it decides | Why it is independent |
 | --- | --- | --- |
-| `curl` | status codes, headers, bodies, `%{content_type}`, `%{num_connects}` | a different program by other people implementing the same RFC |
+| `curl` | status codes, headers, bodies, `%{content_type}`, `%{num_connects}`, the `-C -` resume arithmetic and its exit 33 | a different program by other people implementing the same RFC |
 | `cmp(1)` with `tail`/`head` | byte-for-byte file and range integrity | coreutils does the offset arithmetic, not us |
 | `file(1)` | Content-Type for 4 fixtures | reads the file's **content**; httpd reads its **name** |
 | `date(1)` | the `Last-Modified` value | formats the same mtime through different code |
@@ -295,11 +452,11 @@ Not implemented at all
   completely. Two names pointing here serve the same tree.
 - Directory listings. A directory with no `index.html` is 403. A generated
   listing is a disclosure feature.
-- `If-Range`, `If-Unmodified-Since` and `If-Match`. `If-Modified-Since`
-  and `If-None-Match` are the only two conditionals. The missing `If-Range`
-  is the one that costs something: a `curl -C -` resume of a file that
-  changed between attempts splices two generations together and nothing
-  stops it.
+- `If-Unmodified-Since` and `If-Match`. `If-Modified-Since`,
+  `If-None-Match` and `If-Range` are the three conditionals here. The two
+  missing ones guard writes, and there is nothing here to write to: every
+  method other than GET and HEAD is refused before a precondition could be
+  evaluated.
 - Compression. No `Content-Encoding`, no precompressed `.gz` lookup.
   `Accept-Encoding` is ignored.
 - `Content-Type` charset. Never sent. A guessed charset is a claim about
@@ -337,6 +494,20 @@ source naming its upgrade path)
   Closing it means walking the path with `openat(2)` and `O_NOFOLLOW` one
   segment at a time. It needs a local attacker with write access *inside* the
   document root, who can already replace the file being served.
+- ASan cannot see a one-past-the-end read of a request. `struct conn`
+  holds the request in a fixed `char in[8192]`, and the connections live in
+  one static array, so a hundred-byte request leaves about eight kilobytes of
+  live allocation behind it and a read off the end of the request lands
+  inside it. Measured rather than assumed: a planted
+  `c->in[c->inlen]` read, built with `-fsanitize=address,undefined`, served a
+  200 and produced no diagnostic at all. The same build does catch a planted
+  read past a stack array (`stack-buffer-overflow` with a line number), which
+  is why this was not obvious; the two buffer classes are not instrumented
+  the same way, and it is the one holding untrusted input that is blind.
+  There is no `make overread` gate here yet, because the fix is the one
+  `jsonc` uses for its arena: parse out of an allocation sized to the bytes
+  that actually arrived, behind a build flag, and run the suite both ways.
+  Queued in `PLAN.md` with the measurement.
 - The header section must fit in 8191 bytes (431 otherwise) and the
   request target in 2048 (414). A request body is read and discarded up to
   1MiB, over which it is 413.

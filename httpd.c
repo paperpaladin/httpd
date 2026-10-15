@@ -63,6 +63,7 @@ struct req {
 	long long clen;       /* Content-Length, or -1 if absent */
 	const char *ims;      /* If-Modified-Since, unparsed */
 	const char *inm;      /* If-None-Match, unparsed */
+	const char *ifr;      /* If-Range, unparsed */
 	const char *range;    /* Range, unparsed */
 	int   te_chunked;     /* Transfer-Encoding: chunked */
 	int   te_seen;
@@ -306,6 +307,8 @@ static int parse_headers(char *p, struct req *r)
 			r->ims = v;
 		} else if (name_is(line, "if-none-match")) {
 			r->inm = v;
+		} else if (name_is(line, "if-range")) {
+			r->ifr = v;
 		} else if (name_is(line, "connection")) {
 			if (strcasestr(v, "close")) r->want_close = 1;
 			if (strcasestr(v, "keep-alive")) r->want_keep = 1;
@@ -551,6 +554,61 @@ static int inm_match(const char *list, const char *etag)
 	}
 }
 
+/*
+ * If-Range, RFC 9110 13.1.5. Returns 1 if the Range may be honoured and 0 if
+ * it must be ignored, in which case the whole representation goes out with
+ * 200. A mismatch is not an error: refusing it with 412 or 416 would be the
+ * reflex everywhere else in this program and it is wrong here, because the
+ * client asked a question whose answer is "here is all of it".
+ *
+ * This is the only conditional in the program whose absence corrupts data
+ * rather than producing a wrong status code. A client resuming a download
+ * sends Range: bytes=N-, the file has been rewritten since the first
+ * attempt, and the tail of the new generation lands on the head of the old
+ * one. The result matches neither file, no status code says so, and the
+ * measured case is in the README: 1000 bytes of one file and 3000 of
+ * another, answered 206, nothing anywhere reporting a problem.
+ *
+ * Two rules in 13.1.5 are not the same as the If-None-Match ones next door:
+ *
+ * 1. The comparison is STRONG. W/"x" does not match "x" here, and a weak
+ *    validator must not be used at all. Picking a range out of a
+ *    representation needs the bytes to be the same bytes, which is more than
+ *    weak equivalence promises. The DQUOTE test 13.1.5 gives for telling an
+ *    entity-tag from a date does the work: a field starting W/ is not a
+ *    valid entity-tag for this field, so the condition is false.
+ * 2. The date comparison is EXACT, not the "earlier than or equal to" of
+ *    If-Modified-Since. 13.1.5 says so in as many words. An older date is a
+ *    different generation, not a satisfied condition.
+ *
+ * The strongness rule for dates is the part this server can only half
+ * satisfy. 13.1.5 requires the condition to be false if the date is not a
+ * strong validator in 8.8.2.3's sense, which asks the origin server to know
+ * that the representation did not change twice inside the second the date
+ * covers. stat(2) reports the last write, not the history, so that is not
+ * deducible here. What IS deducible is the half about the future: once the
+ * clock has left that second nothing further can be written inside it, so
+ * mtime < now is required and a file written during the current second is
+ * treated as having no strong date validator. The other half is in the
+ * README as a ceiling, with the ETag as the answer for a client that wants
+ * a resume to be safe inside a one-second window.
+ */
+static int ifrange_ok(const char *v, const char *etag,
+                      const struct stat *st, time_t now)
+{
+	time_t d;
+
+	while (*v == ' ' || *v == '\t') v++;
+
+	/* 13.1.5: "A valid entity-tag can be distinguished from a valid
+	 * HTTP-date by examining the first two characters for a DQUOTE." */
+	if (*v == '"')
+		return strcmp(v, etag) == 0;
+
+	if (parse_http_date(v, &d) != 0) return 0;   /* garbage: no match */
+	return d == st->st_mtime && st->st_mtime < now;
+}
+
 /* ---- byte ranges (RFC 9110 14) ------------------------------------------- */
 /*
  * Returns 0 to ignore the header and send the whole thing, 1 having set
@@ -690,6 +748,7 @@ static void serve(struct conn *c, struct req *r, const char *path)
 	const char *served = path;
 	struct stat st;
 	off_t first, last;
+	time_t now;
 	int fd, partial = 0, notmod;
 
 	/* O_NOFOLLOW is a second, independent refusal for the final
@@ -746,7 +805,8 @@ static void serve(struct conn *c, struct req *r, const char *path)
 		return;
 	}
 
-	date_hdr(date, sizeof date, time(NULL));
+	now = time(NULL);
+	date_hdr(date, sizeof date, now);
 	date_hdr(lmod, sizeof lmod, st.st_mtime);
 	etag_hdr(etag, sizeof etag, &st);
 
@@ -794,7 +854,21 @@ static void serve(struct conn *c, struct req *r, const char *path)
 
 	first = 0;
 	last = st.st_size ? st.st_size - 1 : 0;
-	if (r->range) {
+	/* If-Range is evaluated here and not with the two conditionals above,
+	 * because RFC 9110 13.2.2 puts it last, after the 304 decision: a
+	 * matching If-None-Match is still a 304 even on a range request.
+	 *
+	 * A failed If-Range means the Range header is ignored ENTIRELY, so
+	 * the whole block is skipped and not merely its 206: an unsatisfiable
+	 * range behind a stale validator is a 200, never a 416. Checking
+	 * If-Range inside parse_range's result instead would answer 416
+	 * there, which is the easy version to write and tells the client its
+	 * resume failed for the wrong reason.
+	 *
+	 * 13.1.5 also requires If-Range to be ignored when there is no Range
+	 * at all. That is true here by construction, since nothing reads
+	 * r->ifr outside this block. */
+	if (r->range && (!r->ifr || ifrange_ok(r->ifr, etag, &st, now))) {
 		int rc = parse_range(r->range, st.st_size, &first, &last);
 
 		if (rc == 416) {

@@ -33,6 +33,11 @@ On the wire:
   is present `If-Modified-Since` is ignored entirely, per 13.1.3, and an
   unparseable list is ignored rather than refused. A 304 repeats the `ETag`
   and carries no body and no `Content-Length`.
+- `If-Range` in both forms RFC 9110 13.1.5 allows, an entity-tag compared
+  strongly and an HTTP-date compared exactly, told apart by the leading
+  quote. A validator that does not match means the `Range` is ignored and the
+  whole representation goes out with 200, never 412 or 416. A date is only
+  treated as a validator once the second it names is over.
 - `Accept-Ranges: bytes`, and single byte ranges in all three forms:
   `bytes=a-b`, `bytes=a-`, `bytes=-n`: answered 206 with `Content-Range`.
   Unsatisfiable is 416 with `Content-Range: bytes */size`. Malformed is
@@ -114,13 +119,20 @@ Ranked by how little of each is ours.
    to mark that the request is ours even though the verdict is httpd's.
 
 5. Mutation testing, by hand, recorded in README.md. Not an oracle for the
-   program but for the suite. Fourteen mutants so far: deleting the `realpath`
-   containment check, deleting it together with the `..` refusal, deleting the
-   `..` refusal alone (survives, and the README says why), skewing the `pread`
-   offset by one, reverting the request deadline to a plain idle timeout,
-   planting a stack overread for `make test-asan`, and eight against
-   `If-None-Match` and the ETag. Each one was built and run through the whole
-   suite and the verdict written down.
+   program but for the suite. Twenty-five mutants of the program so far:
+   deleting the `realpath` containment check, deleting it together with the
+   `..` refusal, deleting the `..` refusal alone (survives, and the README
+   says why), skewing the `pread` offset by one, reverting the request
+   deadline to a plain idle timeout, planting a stack overread for
+   `make test-asan`, eight against `If-None-Match` and the ETag, and eleven
+   against `If-Range`. Each one was built and run through the whole suite and
+   the verdict written down. One survives, and it is named.
+
+   Four of the harness as well, against the gate that counts which `If-Range`
+   branch each request reached. Three are caught. The fourth survives because
+   it removes an assertion from a branch that still has another one, so the
+   gate is still telling the truth; the README says so rather than claiming a
+   stronger gate than exists.
 
 ## Non-goals
 
@@ -256,11 +268,42 @@ existed at that point.
             Eight mutants, all caught. No second HTTP server is installed on
             this machine, so curl and the RFC are the whole oracle for this
             one and the README says so.
-- [ ] `If-Range`, so a resumed download of a file that changed restarts
+- [x] `If-Range`, so a resumed download of a file that changed restarts
       instead of splicing two generations together.
       why: this is a data-corruption bug in the one feature people use
       ranges for. `curl -C -` on a file modified between attempts is the
       test, and it currently produces a corrupt result that cmp(1) can see.
+      done: 23 assertions, 258 -> 281. The corruption was measured first and
+            is now an assertion that must keep reproducing: 1000 bytes of one
+            generation followed by 3000 of another, answered 206 with a
+            correct `Content-Range` and a `Content-Length` matching the bytes
+            that followed, and nothing in the exchange saying so.
+            Two rules invert the `If-None-Match` ones next door and each has
+            its own assertion: the tag comparison is strong, so the weak form
+            of this server's own tag does not match, and the date comparison
+            is exact, so a date that satisfies a 304 does not satisfy this.
+            The rule most likely to be written the easy wrong way is that a
+            mismatch ignores the whole `Range` field: a stale validator in
+            front of an unsatisfiable range is a 200 and not a 416, and the
+            mutant that checks `If-Range` after `parse_range` fails that one
+            assertion and nothing else.
+            Half of 13.1.5's strongness requirement for dates is not
+            deducible from `stat(2)` and is a documented ceiling; the half
+            that is, that the second the date names must be over, is enforced
+            and has an assertion with a control.
+            curl is the oracle for more than a status code here. `-C -`
+            builds the resume request from the local file's length, so the
+            offset arithmetic is curl's, and curl's exit 33 on being sent a
+            200 where it asked for a 206 is its own verdict that the resume
+            was declined, with the partial file left untouched and checked
+            with `cmp`. Neither `curl -C -` nor `wget -c` sends `If-Range` on
+            its own, both read off the wire, so the splice is the default
+            behaviour of both installed resume clients.
+            Thirteen requests carry the header, counted per branch and
+            printed, with every one confirmed on the wire because a header
+            curl silently did not send has already produced a vacuous green
+            assertion in this suite once.
+            Eleven mutants, no survivors.
 - [ ] A 301 from `/sub` to `/sub/`.
       why: the README documents serving both as the same `index.html` and
       admits relative links in that document resolve differently. curl's
@@ -277,6 +320,22 @@ existed at that point.
       one that the lenient mode and the strict mode disagree.
 
 ### Milestone 2: oracles the current suite cannot reach
+
+- [ ] Parse the request out of an allocation sized to the bytes that actually
+      arrived, behind a build flag, with a `make overread` target that plants
+      a one-past-the-end read and fails unless the sanitizer reports it.
+      why: measured, not suspected. `struct conn` holds the request in a
+      fixed `char in[8192]` and the connections are one static array, so a
+      planted `c->in[c->inlen]` read under
+      `-fsanitize=address,undefined` served a 200 and produced no diagnostic
+      at all, while a planted read past a stack array in the same build was
+      caught with a line number. The buffer holding untrusted input is the
+      blind one. This comes before the fuzzer because a fuzzer over a parser
+      whose sanitizer cannot see a read one byte past the request is the most
+      expensive way to find nothing: `derx` deleted a bounds check and got 33
+      wrong answers with zero sanitizer reports. `jsonc`'s
+      `-DJSONC_ARENA_DEBUG` is the pattern, and the gate wants an exit code
+      the program cannot otherwise produce, the way `tzf` uses 86.
 
 - [ ] A fuzzer over the request parser, seeded with every fixture in
       `t/run.sh`, under ASan and UBSan, with a `--parse FILE` mode so the
